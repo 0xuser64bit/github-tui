@@ -2,5 +2,6 @@
 //! issues, and pull requests.
 
 pub mod auth;
+pub mod event;
 pub mod github;
 pub mod models;
