@@ -5,6 +5,7 @@ description = "Command line github"
 authors = ["user-64bit <arth.prajapati@outlook.com>"]
 license = "MIT"
 edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
 crossterm = "0.28.1"
