@@ -1,0 +1,144 @@
+//! Minimal, read-only GitHub REST client built on a blocking [`ureq`] agent.
+//!
+//! The client is `Clone` (the underlying agent is reference-counted) so it can
+//! be cheaply handed to worker threads that perform fetches off the UI thread.
+//! Errors are returned as user-facing strings: the TUI's job is to *show* them,
+//! not to programmatically branch on them.
+
+use std::time::Duration;
+
+use serde::de::DeserializeOwned;
+
+use crate::models::{Issue, PullRequest, Repo, User};
+
+const API_ROOT: &str = "https://api.github.com";
+const API_VERSION: &str = "2022-11-28";
+const USER_AGENT: &str = concat!("github-tui/", env!("CARGO_PKG_VERSION"));
+/// One page is plenty for a terminal browser; pagination is a v2 concern.
+const PER_PAGE: usize = 50;
+
+/// A read-only GitHub API client bound to a single token.
+#[derive(Clone)]
+pub struct Github {
+    agent: ureq::Agent,
+    token: String,
+}
+
+// Manual Debug so the token can never leak through `{:?}` / panic reports.
+impl std::fmt::Debug for Github {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Github")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Github {
+    /// Build a client for the given personal-access / OAuth token.
+    pub fn new(token: String) -> Self {
+        let agent = ureq::Agent::config_builder()
+            // Surface 4xx/5xx as normal responses so we can read status and
+            // rate-limit headers instead of an opaque transport error.
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build()
+            .new_agent();
+        Self { agent, token }
+    }
+
+    /// The authenticated user.
+    pub fn current_user(&self) -> Result<User, String> {
+        self.get_json("/user")
+    }
+
+    /// Repositories the token can see, most-recently-updated first.
+    pub fn list_repos(&self) -> Result<Vec<Repo>, String> {
+        self.get_json(&format!(
+            "/user/repos?per_page={PER_PAGE}&sort=updated&affiliation=owner,collaborator,organization_member"
+        ))
+    }
+
+    /// Issues for a repo, with pull requests filtered out (the issues endpoint
+    /// returns both).
+    pub fn list_issues(&self, owner: &str, repo: &str) -> Result<Vec<Issue>, String> {
+        let issues: Vec<Issue> = self.get_json(&format!(
+            "/repos/{owner}/{repo}/issues?state=all&per_page={PER_PAGE}"
+        ))?;
+        Ok(issues
+            .into_iter()
+            .filter(|i| !i.is_pull_request())
+            .collect())
+    }
+
+    /// Pull requests for a repo.
+    pub fn list_pulls(&self, owner: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
+        self.get_json(&format!(
+            "/repos/{owner}/{repo}/pulls?state=all&per_page={PER_PAGE}"
+        ))
+    }
+
+    fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let url = format!("{API_ROOT}{path}");
+        let mut resp = self
+            .agent
+            .get(&url)
+            .header("Authorization", &format!("Bearer {}", self.token))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .header("User-Agent", USER_AGENT)
+            .call()
+            .map_err(|e| format!("Network error: {e}"))?;
+
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let remaining = resp
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok());
+            return Err(describe_status(status, remaining));
+        }
+
+        resp.body_mut()
+            .read_json::<T>()
+            .map_err(|e| format!("Could not parse GitHub response: {e}"))
+    }
+}
+
+/// Translate an HTTP status into a message a human can act on.
+///
+/// Pure and side-effect free so it can be unit tested without a network.
+pub fn describe_status(status: u16, rate_limit_remaining: Option<&str>) -> String {
+    match status {
+        401 => "Authentication failed — your token is invalid or expired.".to_string(),
+        403 if rate_limit_remaining == Some("0") => {
+            "GitHub API rate limit exceeded. Try again in a little while.".to_string()
+        }
+        403 => "Access forbidden — your token may be missing the required scopes.".to_string(),
+        404 => "Not found — the repository may be private or renamed.".to_string(),
+        s @ 500..=599 => format!("GitHub is having problems (HTTP {s}). Try again shortly."),
+        s => format!("Unexpected GitHub API response (HTTP {s})."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_messages_are_actionable() {
+        assert!(describe_status(401, None).contains("token"));
+        assert!(describe_status(403, Some("0")).contains("rate limit"));
+        assert!(describe_status(403, Some("42")).contains("scopes"));
+        assert!(describe_status(404, None).contains("Not found"));
+        assert!(describe_status(503, None).contains("HTTP 503"));
+        assert!(describe_status(418, None).contains("HTTP 418"));
+    }
+
+    #[test]
+    fn debug_redacts_token() {
+        let client = Github::new("super-secret-token".to_string());
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(rendered.contains("redacted"));
+    }
+}

@@ -8,9 +8,12 @@ edition = "2024"
 rust-version = "1.85"
 
 [dependencies]
-crossterm = "0.28.1"
 ratatui = "0.30.0"
-color-eyre = "0.6.3"
+color-eyre = "0.6.5"
+# Blocking HTTP with rustls (no OpenSSL); run on worker threads, not an async runtime.
+ureq = { version = "3.3", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]
