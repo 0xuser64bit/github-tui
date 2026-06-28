@@ -369,3 +369,125 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         .areas(horizontal);
     vertical
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::Github;
+    use crate::models::{Issue, PullRequest, User};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::mpsc;
+
+    /// Render `app` into an 80x24 test buffer and return its text content.
+    /// Panics in `render` (layout/index bugs) fail the test here.
+    fn rendered(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn authed_app() -> App {
+        let (tx, _rx) = mpsc::channel();
+        App::new(Some(Github::new("test-token".to_string())), tx)
+    }
+
+    fn sample_repo() -> Repo {
+        Repo {
+            name: "github-tui".to_string(),
+            full_name: "user-64bit/github-tui".to_string(),
+            description: Some("a terminal UI for github".to_string()),
+            language: Some("Rust".to_string()),
+            stargazers_count: 7,
+            open_issues_count: 2,
+            fork: false,
+            private: false,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn auth_screen_explains_how_to_authenticate() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(None, tx);
+        let text = rendered(&mut app);
+        assert!(text.contains("No GitHub token found"));
+        assert!(text.contains("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn loading_then_loaded_repos_render() {
+        let mut app = authed_app();
+        // Loading state shows the spinner copy.
+        app.repos = Load::Loading;
+        assert!(rendered(&mut app).contains("Loading repositories"));
+
+        // Loaded state shows the repo and its metadata.
+        app.repos = Load::Loaded(vec![sample_repo()]);
+        app.repos_state.select(Some(0));
+        let text = rendered(&mut app);
+        assert!(text.contains("github-tui"));
+        assert!(text.contains("Rust"));
+    }
+
+    #[test]
+    fn failed_repos_show_retry_hint() {
+        let mut app = authed_app();
+        app.repos = Load::Failed("Network error: offline".to_string());
+        let text = rendered(&mut app);
+        assert!(text.contains("Network error"));
+        assert!(text.contains("retry"));
+    }
+
+    #[test]
+    fn detail_view_renders_issues_and_pulls() {
+        let mut app = authed_app();
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(sample_repo());
+        app.tab = Tab::Issues;
+
+        app.issues = Load::Loaded(vec![Issue {
+            number: 42,
+            title: "fix the crash".to_string(),
+            state: "open".to_string(),
+            comments: 3,
+            user: Some(User {
+                login: "octocat".to_string(),
+            }),
+            pull_request: None,
+        }]);
+        app.pulls = Load::Loaded(vec![PullRequest {
+            number: 7,
+            title: "add tests".to_string(),
+            state: "open".to_string(),
+            draft: true,
+            user: Some(User {
+                login: "hubber".to_string(),
+            }),
+        }]);
+
+        let issues_view = rendered(&mut app);
+        assert!(issues_view.contains("#42"));
+        assert!(issues_view.contains("fix the crash"));
+        assert!(issues_view.contains("octocat"));
+
+        app.tab = Tab::Pulls;
+        let pulls_view = rendered(&mut app);
+        assert!(pulls_view.contains("#7"));
+        assert!(pulls_view.contains("add tests"));
+        assert!(pulls_view.contains("[draft]"));
+    }
+
+    #[test]
+    fn help_overlay_renders() {
+        let mut app = authed_app();
+        app.show_help = true;
+        assert!(rendered(&mut app).contains("Keybindings"));
+    }
+}
