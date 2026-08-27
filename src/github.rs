@@ -7,9 +7,11 @@
 
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use ureq::config::RedirectAuthHeaders;
 
-use crate::models::{Issue, PullRequest, Repo, User};
+use crate::models::{Issue, PullRequest, Repo, SearchedPullRequest, User};
 
 const API_ROOT: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
@@ -41,6 +43,9 @@ impl Github {
             // rate-limit headers instead of an opaque transport error.
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(20)))
+            // GitHub returns 301 for renamed repos; follow redirects and keep
+            // the bearer token across the same-host redirect.
+            .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .build()
             .new_agent();
         Self { agent, token }
@@ -75,6 +80,23 @@ impl Github {
         self.get_json_paginated(&format!(
             "/repos/{owner}/{repo}/pulls?state=all&per_page={PER_PAGE}"
         ))
+    }
+
+    /// Pull requests authored by the authenticated user across all repos.
+    ///
+    /// GitHub's Search API does not allow `state:all` (it returns zero results),
+    /// so we fetch `open` and `closed` separately and concatenate them. Closed
+    /// PRs are returned most-recently-updated first, which keeps the combined
+    /// list useful without a second client-side sort.
+    pub fn my_pulls(&self, login: &str) -> Result<Vec<SearchedPullRequest>, String> {
+        let mut all = Vec::new();
+        for state in ["open", "closed"] {
+            let query = format!("type:pr author:{login} state:{state}");
+            let encoded = urlencode(&query);
+            let path = format!("/search/issues?q={encoded}&per_page={PER_PAGE}");
+            all.extend(self.get_json_paginated_search::<SearchedPullRequest>(&path)?);
+        }
+        Ok(all)
     }
 
     fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
@@ -150,6 +172,72 @@ impl Github {
 
         Ok(all)
     }
+
+    /// Fetch a paginated Search API endpoint, which wraps results in a
+    /// `{ total_count, incomplete_results, items }` envelope instead of a bare
+    /// array.
+    fn get_json_paginated_search<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, String> {
+        #[derive(Deserialize)]
+        struct SearchEnvelope<T> {
+            items: Vec<T>,
+        }
+
+        let mut all: Vec<T> = Vec::new();
+        let mut url = format!("{API_ROOT}{path}");
+
+        loop {
+            let mut resp = self
+                .agent
+                .get(&url)
+                .header("Authorization", &format!("Bearer {}", self.token))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .header("User-Agent", USER_AGENT)
+                .call()
+                .map_err(|e| format!("Network error: {e}"))?;
+
+            let status = resp.status().as_u16();
+            if !(200..300).contains(&status) {
+                let remaining = resp
+                    .headers()
+                    .get("x-ratelimit-remaining")
+                    .and_then(|v| v.to_str().ok());
+                return Err(describe_status(status, remaining));
+            }
+
+            let next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_next_link);
+
+            let envelope: SearchEnvelope<T> = resp
+                .body_mut()
+                .read_json()
+                .map_err(|e| format!("Could not parse GitHub response: {e}"))?;
+
+            all.extend(envelope.items);
+
+            match next {
+                Some(next_url) => url = next_url,
+                None => break,
+            }
+        }
+
+        Ok(all)
+    }
+}
+
+/// Percent-encode the characters GitHub's Search API treats specially.
+///
+/// A full form-encoder would be overkill for our one query shape; we only need
+/// spaces and colons escaped so `type:pr author:octocat state:open` survives
+/// the trip through a query string.
+fn urlencode(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace(':', "%3A")
 }
 
 /// Extract the URL for `rel="next"` from a GitHub `Link` header value.
@@ -224,5 +312,13 @@ mod tests {
     #[test]
     fn parse_next_link_returns_none_on_empty() {
         assert_eq!(parse_next_link(""), None);
+    }
+
+    #[test]
+    fn urlencode_escapes_search_query() {
+        assert_eq!(
+            urlencode("type:pr author:octocat state:open"),
+            "type%3Apr%20author%3Aoctocat%20state%3Aopen"
+        );
     }
 }
