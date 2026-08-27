@@ -10,6 +10,7 @@ A fast, read-only terminal UI for browsing your GitHub **repositories**,
 
 - Browse repositories you own, collaborate on, or share via an org
 - Drill into a repository's **Issues** and **Pull Requests** in tabs
+- View all **your pull requests** across every repository (`m`)
 - Open the current repo / issue / PR in your browser (`o` or `Enter`)
 - Non-blocking UI: network requests never freeze rendering or input
 - Loading spinners, empty states, and actionable error messages
@@ -61,6 +62,7 @@ than failing.
 | `Enter` / `l` / `→` | Open repository (or issue/PR in browser) |
 | `Esc` / `h` / `←` | Back to repository list |
 | `Tab` | Switch Issues / Pull Requests |
+| `m` | View your pull requests |
 | `o` | Open current selection in browser |
 | `r` | Refresh the current view |
 | `?` | Toggle help |
@@ -73,8 +75,10 @@ or merging — those add token-scope, validation, and confirmation-flow surface
 that the first version deliberately avoids. The browser integration (`o`) is the
 escape hatch for actions that need the full GitHub UI.
 
-Other current limitations: results are capped at the first page (50 items) per
-list; there is no search or filtering yet.
+The global "my pull requests" view uses GitHub's Search API, which has a lower
+rate limit than the core REST endpoints (30 requests per minute per user on the
+free plan). The app fetches open and closed PRs separately, so opening that view
+consumes two search requests.
 
 ## Architecture
 
