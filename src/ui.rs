@@ -17,25 +17,42 @@ const CLOSED: Color = Color::Magenta;
 /// Entry point: lay out header / body / footer and draw the active screen.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let chunks = Layout::vertical([
-        Constraint::Length(1), // header
-        Constraint::Min(0),    // body
-        Constraint::Length(1), // footer
-    ])
-    .split(area);
 
-    render_header(frame, app, chunks[0]);
+    let (header_area, search_area, body_area, footer_area) = if app.search_active {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // header
+            Constraint::Length(1), // search bar
+            Constraint::Min(0),    // body
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+        (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+    } else {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // header
+            Constraint::Min(0),    // body
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+        (chunks[0], None, chunks[1], chunks[2])
+    };
+
+    render_header(frame, app, header_area);
+
+    if let Some(search_area) = search_area {
+        render_search_bar(frame, app, search_area);
+    }
 
     if app.needs_auth() {
-        render_auth_required(frame, chunks[1]);
+        render_auth_required(frame, body_area);
     } else {
         match app.screen {
-            Screen::Repos => render_repos(frame, app, chunks[1]),
-            Screen::RepoDetail => render_detail(frame, app, chunks[1]),
+            Screen::Repos => render_repos(frame, app, body_area),
+            Screen::RepoDetail => render_detail(frame, app, body_area),
         }
     }
 
-    render_footer(frame, app, chunks[2]);
+    render_footer(frame, app, footer_area);
 
     if app.show_help {
         render_help(frame, area);
@@ -76,6 +93,18 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled("/ ", Style::new().fg(ACCENT).bold()),
+        Span::raw(app.search_query.clone()),
+        Span::styled("█", Style::new().fg(ACCENT)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::new().bg(Color::Indexed(235))),
+        area,
+    );
+}
+
 fn render_repos(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::bordered()
         .border_style(Style::new().dim())
@@ -90,9 +119,23 @@ fn render_repos(frame: &mut Frame, app: &mut App, area: Rect) {
             render_status_box(frame, area, block, &Text::from("No repositories found."))
         }
         Load::Loaded(repos) => {
-            let items: Vec<ListItem> = repos.iter().map(repo_item).collect();
-            let list = list_widget(items, block);
-            frame.render_stateful_widget(list, area, &mut app.repos_state);
+            if app.filtered_repos.is_empty() {
+                render_status_box(
+                    frame,
+                    area,
+                    block,
+                    &Text::from("No matching repositories."),
+                );
+            } else {
+                let items: Vec<ListItem> = app
+                    .filtered_repos
+                    .iter()
+                    .filter_map(|&i| repos.get(i))
+                    .map(repo_item)
+                    .collect();
+                let list = list_widget(items, block);
+                frame.render_stateful_widget(list, area, &mut app.repos_state);
+            }
         }
     }
 }
@@ -115,8 +158,23 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 render_status_box(frame, rows[1], block, &Text::from("No issues."))
             }
             Load::Loaded(items) => {
-                let list = list_widget(items.iter().map(issue_item).collect(), block);
-                frame.render_stateful_widget(list, rows[1], &mut app.issues_state);
+                if app.filtered_issues.is_empty() {
+                    render_status_box(
+                        frame,
+                        rows[1],
+                        block,
+                        &Text::from("No matching issues."),
+                    );
+                } else {
+                    let filtered: Vec<ListItem> = app
+                        .filtered_issues
+                        .iter()
+                        .filter_map(|&i| items.get(i))
+                        .map(issue_item)
+                        .collect();
+                    let list = list_widget(filtered, block);
+                    frame.render_stateful_widget(list, rows[1], &mut app.issues_state);
+                }
             }
         },
         Tab::Pulls => match &app.pulls {
@@ -128,8 +186,23 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 render_status_box(frame, rows[1], block, &Text::from("No pull requests."))
             }
             Load::Loaded(items) => {
-                let list = list_widget(items.iter().map(pull_item).collect(), block);
-                frame.render_stateful_widget(list, rows[1], &mut app.pulls_state);
+                if app.filtered_pulls.is_empty() {
+                    render_status_box(
+                        frame,
+                        rows[1],
+                        block,
+                        &Text::from("No matching pull requests."),
+                    );
+                } else {
+                    let filtered: Vec<ListItem> = app
+                        .filtered_pulls
+                        .iter()
+                        .filter_map(|&i| items.get(i))
+                        .map(pull_item)
+                        .collect();
+                    let list = list_widget(filtered, block);
+                    frame.render_stateful_widget(list, rows[1], &mut app.pulls_state);
+                }
             }
         },
     }
@@ -169,11 +242,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let hints = if app.needs_auth() {
         " q quit  ·  ? help"
+    } else if app.search_active {
+        " type to filter · ↑↓ move · enter select · esc clear"
     } else {
         match app.screen {
-            Screen::Repos => " ↑↓ move · enter open · o browser · r refresh · ? help · q quit",
+            Screen::Repos => " ↑↓ move · enter open · / search · o browser · r refresh · ? help · q quit",
             Screen::RepoDetail => {
-                " ↑↓ move · tab switch · enter/o browser · esc back · r refresh · q quit"
+                " ↑↓ move · tab switch · / search · enter/o browser · esc back · r refresh · q quit"
             }
         }
     };
@@ -211,7 +286,7 @@ fn render_auth_required(frame: &mut Frame, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(area, 56, 16);
+    let popup = centered_rect(area, 56, 17);
     frame.render_widget(Clear, popup);
 
     let rows = [
@@ -220,6 +295,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("Enter / l / →", "Open repo (or issue/PR in browser)"),
         ("Esc / h / ←", "Back to repository list"),
         ("Tab", "Switch Issues / Pull Requests"),
+        ("/", "Search / filter the current list"),
         ("o", "Open current selection in browser"),
         ("r", "Refresh the current view"),
         ("?", "Toggle this help"),
@@ -430,6 +506,7 @@ mod tests {
 
         // Loaded state shows the repo and its metadata.
         app.repos = Load::Loaded(vec![sample_repo()]);
+        app.refilter();
         app.repos_state.select(Some(0));
         let text = rendered(&mut app);
         assert!(text.contains("github-tui"));
@@ -471,6 +548,7 @@ mod tests {
                 login: "hubber".to_string(),
             }),
         }]);
+        app.refilter();
 
         let issues_view = rendered(&mut app);
         assert!(issues_view.contains("#42"));

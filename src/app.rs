@@ -95,6 +95,17 @@ pub struct App {
     pub(crate) show_help: bool,
     pub(crate) status: Option<String>,
     spinner: usize,
+
+    /// Whether the search input bar is active.
+    pub(crate) search_active: bool,
+    /// Current search query text.
+    pub(crate) search_query: String,
+    /// Indices into the loaded repos that match the current query.
+    pub(crate) filtered_repos: Vec<usize>,
+    /// Indices into the loaded issues that match the current query.
+    pub(crate) filtered_issues: Vec<usize>,
+    /// Indices into the loaded pulls that match the current query.
+    pub(crate) filtered_pulls: Vec<usize>,
 }
 
 impl App {
@@ -118,6 +129,11 @@ impl App {
             show_help: false,
             status: None,
             spinner: 0,
+            search_active: false,
+            search_query: String::new(),
+            filtered_repos: Vec::new(),
+            filtered_issues: Vec::new(),
+            filtered_pulls: Vec::new(),
         }
     }
 
@@ -180,12 +196,38 @@ impl App {
             return;
         }
 
+        // While the search bar is active, most keys edit the query.
+        if self.search_active {
+            match key.code {
+                KeyCode::Esc => self.exit_search(),
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.refilter();
+                }
+                KeyCode::Char(c) => {
+                    self.search_query.push(c);
+                    self.refilter();
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                    self.move_cursor(delta);
+                }
+                KeyCode::Enter => {
+                    self.exit_search();
+                    self.activate_selection();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         self.status = None;
         match key.code {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('o') => self.open_selected_in_browser(),
+            KeyCode::Char('/') => self.enter_search(),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Home | KeyCode::Char('g') => self.move_to_edge(true),
@@ -202,18 +244,21 @@ impl App {
             Message::User(result) => self.user = result.into(),
             Message::Repos(result) => {
                 self.repos = result.into();
-                Self::select_first(&mut self.repos_state, self.repos.len());
+                self.refilter();
+                Self::select_first(&mut self.repos_state, self.filtered_repos.len());
             }
             Message::Issues { repo, result } => {
                 if self.is_active_repo(&repo) {
                     self.issues = result.into();
-                    Self::select_first(&mut self.issues_state, self.issues.len());
+                    self.refilter();
+                    Self::select_first(&mut self.issues_state, self.filtered_issues.len());
                 }
             }
             Message::Pulls { repo, result } => {
                 if self.is_active_repo(&repo) {
                     self.pulls = result.into();
-                    Self::select_first(&mut self.pulls_state, self.pulls.len());
+                    self.refilter();
+                    Self::select_first(&mut self.pulls_state, self.filtered_pulls.len());
                 }
             }
         }
@@ -241,6 +286,7 @@ impl App {
         self.pulls = Load::Idle;
         self.issues_state.select(None);
         self.pulls_state.select(None);
+        self.clear_search();
         self.fetch_issues(&repo);
         self.fetch_pulls(&repo);
     }
@@ -249,6 +295,7 @@ impl App {
         if self.screen == Screen::RepoDetail {
             self.screen = Screen::Repos;
             self.active_repo = None;
+            self.clear_search();
         }
     }
 
@@ -300,24 +347,24 @@ impl App {
     }
 
     /// The list state and item count for whatever the user is currently
-    /// navigating.
+    /// navigating. Uses filtered counts when a search is active.
     fn active_list(&mut self) -> (&mut ListState, usize) {
         match self.screen {
-            Screen::Repos => (&mut self.repos_state, self.repos.len()),
+            Screen::Repos => (&mut self.repos_state, self.filtered_repos.len()),
             Screen::RepoDetail => match self.tab {
-                Tab::Issues => (&mut self.issues_state, self.issues.len()),
-                Tab::Pulls => (&mut self.pulls_state, self.pulls.len()),
+                Tab::Issues => (&mut self.issues_state, self.filtered_issues.len()),
+                Tab::Pulls => (&mut self.pulls_state, self.filtered_pulls.len()),
             },
         }
     }
 
     fn selected_repo(&self) -> Option<Repo> {
         match &self.repos {
-            Load::Loaded(repos) => self
-                .repos_state
-                .selected()
-                .and_then(|i| repos.get(i))
-                .cloned(),
+            Load::Loaded(repos) => {
+                let visible_idx = self.repos_state.selected()?;
+                let real_idx = *self.filtered_repos.get(visible_idx)?;
+                repos.get(real_idx).cloned()
+            }
             _ => None,
         }
     }
@@ -335,7 +382,9 @@ impl App {
                         let Load::Loaded(items) = &self.issues else {
                             return None;
                         };
-                        let issue = items.get(self.issues_state.selected()?)?;
+                        let visible_idx = self.issues_state.selected()?;
+                        let real_idx = *self.filtered_issues.get(visible_idx)?;
+                        let issue = items.get(real_idx)?;
                         Some(format!(
                             "https://github.com/{}/issues/{}",
                             repo.full_name, issue.number
@@ -345,7 +394,9 @@ impl App {
                         let Load::Loaded(items) = &self.pulls else {
                             return None;
                         };
-                        let pr = items.get(self.pulls_state.selected()?)?;
+                        let visible_idx = self.pulls_state.selected()?;
+                        let real_idx = *self.filtered_pulls.get(visible_idx)?;
+                        let pr = items.get(real_idx)?;
                         Some(format!(
                             "https://github.com/{}/pull/{}",
                             repo.full_name, pr.number
@@ -364,6 +415,97 @@ impl App {
 
     fn select_first(state: &mut ListState, len: usize) {
         state.select((len > 0).then_some(0));
+    }
+
+    // --- search / filter ---------------------------------------------------
+
+    fn enter_search(&mut self) {
+        self.search_active = true;
+        self.search_query.clear();
+        // Don't refilter yet — empty query shows everything.
+    }
+
+    fn exit_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.refilter();
+    }
+
+    /// Reset search state without refiltering (used on screen transitions).
+    fn clear_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.filtered_repos.clear();
+        self.filtered_issues.clear();
+        self.filtered_pulls.clear();
+        self.refilter();
+    }
+
+    /// Rebuild the filtered index vectors for the current screen from the
+    /// loaded data and the search query. Case-insensitive substring match.
+    pub(crate) fn refilter(&mut self) {
+        let query = self.search_query.to_lowercase();
+
+        // Repos — always refilter so the repo list stays consistent.
+        if let Load::Loaded(repos) = &self.repos {
+            self.filtered_repos = repos
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    query.is_empty()
+                        || r.name.to_lowercase().contains(&query)
+                        || r.full_name.to_lowercase().contains(&query)
+                        || r.description
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect();
+        } else {
+            self.filtered_repos.clear();
+        }
+
+        // Issues
+        if let Load::Loaded(issues) = &self.issues {
+            self.filtered_issues = issues
+                .iter()
+                .enumerate()
+                .filter(|(_, issue)| {
+                    query.is_empty() || issue.title.to_lowercase().contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect();
+        } else {
+            self.filtered_issues.clear();
+        }
+
+        // Pulls
+        if let Load::Loaded(pulls) = &self.pulls {
+            self.filtered_pulls = pulls
+                .iter()
+                .enumerate()
+                .filter(|(_, pr)| query.is_empty() || pr.title.to_lowercase().contains(&query))
+                .map(|(i, _)| i)
+                .collect();
+        } else {
+            self.filtered_pulls.clear();
+        }
+
+        // Clamp cursor for the active list.
+        let (state, len) = match self.screen {
+            Screen::Repos => (&mut self.repos_state, self.filtered_repos.len()),
+            Screen::RepoDetail => match self.tab {
+                Tab::Issues => (&mut self.issues_state, self.filtered_issues.len()),
+                Tab::Pulls => (&mut self.pulls_state, self.filtered_pulls.len()),
+            },
+        };
+        if len == 0 {
+            state.select(None);
+        } else if state.selected().is_none_or(|i| i >= len) {
+            state.select(Some(0));
+        }
     }
 
     // --- fetches (each spawns a worker thread) -----------------------------
@@ -525,6 +667,7 @@ mod tests {
     fn opening_a_repo_enters_detail_view() {
         let mut app = test_app();
         app.repos = Load::Loaded(vec![repo("user-64bit/github-tui")]);
+        app.refilter();
         app.repos_state.select(Some(0));
 
         app.activate_selection();
@@ -541,6 +684,7 @@ mod tests {
     fn back_returns_to_repo_list() {
         let mut app = test_app();
         app.repos = Load::Loaded(vec![repo("a/b")]);
+        app.refilter();
         app.repos_state.select(Some(0));
         app.activate_selection();
         app.go_back();
@@ -564,10 +708,67 @@ mod tests {
     fn selected_repo_url_points_at_github() {
         let mut app = test_app();
         app.repos = Load::Loaded(vec![repo("user-64bit/github-tui")]);
+        app.refilter();
         app.repos_state.select(Some(0));
         assert_eq!(
             app.selected_url().as_deref(),
             Some("https://github.com/user-64bit/github-tui")
         );
+    }
+
+    #[test]
+    fn search_filters_repos_by_name() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![
+            repo("user/alpha"),
+            repo("user/beta"),
+            repo("user/gamma"),
+        ]);
+        app.refilter();
+        assert_eq!(app.filtered_repos.len(), 3);
+
+        app.search_query = "bet".to_string();
+        app.refilter();
+        assert_eq!(app.filtered_repos.len(), 1);
+        assert_eq!(app.filtered_repos[0], 1); // "beta" is at index 1
+    }
+
+    #[test]
+    fn search_is_case_insensitive() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("user/MyRepo")]);
+        app.search_query = "myrepo".to_string();
+        app.refilter();
+        assert_eq!(app.filtered_repos.len(), 1);
+    }
+
+    #[test]
+    fn clearing_search_restores_all_items() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("user/a"), repo("user/b")]);
+        app.search_query = "zzz".to_string();
+        app.refilter();
+        assert_eq!(app.filtered_repos.len(), 0);
+
+        app.exit_search();
+        assert_eq!(app.filtered_repos.len(), 2);
+        assert!(!app.search_active);
+    }
+
+    #[test]
+    fn search_clamps_cursor_when_results_shrink() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![
+            repo("user/aaa"),
+            repo("user/bbb"),
+            repo("user/ccc"),
+        ]);
+        app.refilter();
+        app.repos_state.select(Some(2)); // cursor on "ccc"
+
+        app.search_query = "aaa".to_string();
+        app.refilter();
+        // Only 1 result, cursor must have been clamped to 0.
+        assert_eq!(app.repos_state.selected(), Some(0));
     }
 }
