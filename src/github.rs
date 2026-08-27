@@ -14,8 +14,8 @@ use crate::models::{Issue, PullRequest, Repo, User};
 const API_ROOT: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = concat!("github-tui/", env!("CARGO_PKG_VERSION"));
-/// One page is plenty for a terminal browser; pagination is a v2 concern.
-const PER_PAGE: usize = 50;
+/// GitHub caps per_page at 100; we paginate via `Link` headers to fetch all.
+const PER_PAGE: usize = 100;
 
 /// A read-only GitHub API client bound to a single token.
 #[derive(Clone)]
@@ -53,7 +53,7 @@ impl Github {
 
     /// Repositories the token can see, most-recently-updated first.
     pub fn list_repos(&self) -> Result<Vec<Repo>, String> {
-        self.get_json(&format!(
+        self.get_json_paginated(&format!(
             "/user/repos?per_page={PER_PAGE}&sort=updated&affiliation=owner,collaborator,organization_member"
         ))
     }
@@ -61,7 +61,7 @@ impl Github {
     /// Issues for a repo, with pull requests filtered out (the issues endpoint
     /// returns both).
     pub fn list_issues(&self, owner: &str, repo: &str) -> Result<Vec<Issue>, String> {
-        let issues: Vec<Issue> = self.get_json(&format!(
+        let issues: Vec<Issue> = self.get_json_paginated(&format!(
             "/repos/{owner}/{repo}/issues?state=all&per_page={PER_PAGE}"
         ))?;
         Ok(issues
@@ -72,7 +72,7 @@ impl Github {
 
     /// Pull requests for a repo.
     pub fn list_pulls(&self, owner: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
-        self.get_json(&format!(
+        self.get_json_paginated(&format!(
             "/repos/{owner}/{repo}/pulls?state=all&per_page={PER_PAGE}"
         ))
     }
@@ -102,6 +102,70 @@ impl Github {
             .read_json::<T>()
             .map_err(|e| format!("Could not parse GitHub response: {e}"))
     }
+
+    /// Fetch a paginated list endpoint, following `Link: rel="next"` headers
+    /// until every page has been collected.
+    fn get_json_paginated<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, String> {
+        let mut all: Vec<T> = Vec::new();
+        let mut url = format!("{API_ROOT}{path}");
+
+        loop {
+            let mut resp = self
+                .agent
+                .get(&url)
+                .header("Authorization", &format!("Bearer {}", self.token))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .header("User-Agent", USER_AGENT)
+                .call()
+                .map_err(|e| format!("Network error: {e}"))?;
+
+            let status = resp.status().as_u16();
+            if !(200..300).contains(&status) {
+                let remaining = resp
+                    .headers()
+                    .get("x-ratelimit-remaining")
+                    .and_then(|v| v.to_str().ok());
+                return Err(describe_status(status, remaining));
+            }
+
+            let next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_next_link);
+
+            let page: Vec<T> = resp
+                .body_mut()
+                .read_json()
+                .map_err(|e| format!("Could not parse GitHub response: {e}"))?;
+
+            all.extend(page);
+
+            match next {
+                Some(next_url) => url = next_url,
+                None => break,
+            }
+        }
+
+        Ok(all)
+    }
+}
+
+/// Extract the URL for `rel="next"` from a GitHub `Link` header value.
+///
+/// GitHub's format: `<https://…?page=2>; rel="next", <https://…?page=5>; rel="last"`
+fn parse_next_link(header: &str) -> Option<String> {
+    for segment in header.split(',') {
+        let segment = segment.trim();
+        if segment.contains("rel=\"next\"") {
+            // Extract the URL between < and >
+            let start = segment.find('<')? + 1;
+            let end = segment.find('>')?;
+            return Some(segment[start..end].to_string());
+        }
+    }
+    None
 }
 
 /// Translate an HTTP status into a message a human can act on.
@@ -140,5 +204,25 @@ mod tests {
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("super-secret-token"));
         assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn parse_next_link_extracts_next_url() {
+        let header = r#"<https://api.github.com/user/repos?page=2&per_page=100>; rel="next", <https://api.github.com/user/repos?page=5&per_page=100>; rel="last""#;
+        assert_eq!(
+            parse_next_link(header),
+            Some("https://api.github.com/user/repos?page=2&per_page=100".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_next_link_returns_none_on_last_page() {
+        let header = r#"<https://api.github.com/user/repos?page=1&per_page=100>; rel="prev", <https://api.github.com/user/repos?page=5&per_page=100>; rel="last""#;
+        assert_eq!(parse_next_link(header), None);
+    }
+
+    #[test]
+    fn parse_next_link_returns_none_on_empty() {
+        assert_eq!(parse_next_link(""), None);
     }
 }
