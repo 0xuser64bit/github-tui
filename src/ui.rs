@@ -120,12 +120,7 @@ fn render_repos(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         Load::Loaded(repos) => {
             if app.filtered_repos.is_empty() {
-                render_status_box(
-                    frame,
-                    area,
-                    block,
-                    &Text::from("No matching repositories."),
-                );
+                render_status_box(frame, area, block, &Text::from("No matching repositories."));
             } else {
                 let items: Vec<ListItem> = app
                     .filtered_repos
@@ -159,12 +154,7 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             Load::Loaded(items) => {
                 if app.filtered_issues.is_empty() {
-                    render_status_box(
-                        frame,
-                        rows[1],
-                        block,
-                        &Text::from("No matching issues."),
-                    );
+                    render_status_box(frame, rows[1], block, &Text::from("No matching issues."));
                 } else {
                     let filtered: Vec<ListItem> = app
                         .filtered_issues
@@ -246,7 +236,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         " type to filter · ↑↓ move · enter select · esc clear"
     } else {
         match app.screen {
-            Screen::Repos => " ↑↓ move · enter open · / search · o browser · r refresh · ? help · q quit",
+            Screen::Repos => {
+                " ↑↓ move · enter open · / search · o browser · r refresh · ? help · q quit"
+            }
             Screen::RepoDetail => {
                 " ↑↓ move · tab switch · / search · enter/o browser · esc back · r refresh · q quit"
             }

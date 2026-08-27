@@ -758,11 +758,7 @@ mod tests {
     #[test]
     fn search_clamps_cursor_when_results_shrink() {
         let mut app = test_app();
-        app.repos = Load::Loaded(vec![
-            repo("user/aaa"),
-            repo("user/bbb"),
-            repo("user/ccc"),
-        ]);
+        app.repos = Load::Loaded(vec![repo("user/aaa"), repo("user/bbb"), repo("user/ccc")]);
         app.refilter();
         app.repos_state.select(Some(2)); // cursor on "ccc"
 
