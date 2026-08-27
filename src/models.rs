@@ -89,6 +89,9 @@ pub struct PullRequest {
     pub draft: bool,
     #[serde(default)]
     pub user: Option<User>,
+    /// Present (non-null) only for merged pull requests.
+    #[serde(default)]
+    pub merged_at: Option<String>,
 }
 
 impl PullRequest {
@@ -96,6 +99,84 @@ impl PullRequest {
     pub fn author(&self) -> &str {
         self.user.as_ref().map_or("unknown", |u| u.login.as_str())
     }
+
+    /// Whether this pull request has been merged.
+    pub fn is_merged(&self) -> bool {
+        self.merged_at.is_some()
+    }
+
+    /// Normalized state: `"open"`, `"merged"`, or `"closed"`.
+    pub fn effective_state(&self) -> &str {
+        if self.state == "closed" && self.is_merged() {
+            "merged"
+        } else {
+            &self.state
+        }
+    }
+}
+
+/// A pull request result from the GitHub Search API.
+///
+/// This is intentionally a separate type from [`PullRequest`]: the search
+/// endpoint wraps pull requests in an issue-shaped payload and identifies the
+/// repository via `repository_url` rather than an owner/name pair.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchedPullRequest {
+    pub number: u64,
+    pub title: String,
+    /// `"open"` or `"closed"`.
+    pub state: String,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub user: Option<User>,
+    #[serde(default)]
+    pub html_url: Option<String>,
+    #[serde(default)]
+    pub repository_url: Option<String>,
+    #[serde(default)]
+    pub pull_request: Option<PullRequestMetadata>,
+}
+
+impl SearchedPullRequest {
+    /// Author login, or `"unknown"` when GitHub omits the user.
+    pub fn author(&self) -> &str {
+        self.user.as_ref().map_or("unknown", |u| u.login.as_str())
+    }
+
+    /// Whether this pull request has been merged.
+    pub fn is_merged(&self) -> bool {
+        self.pull_request
+            .as_ref()
+            .is_some_and(|pr| pr.merged_at.is_some())
+    }
+
+    /// Normalized state: `"open"`, `"merged"`, or `"closed"`.
+    pub fn effective_state(&self) -> &str {
+        if self.state == "closed" && self.is_merged() {
+            "merged"
+        } else {
+            &self.state
+        }
+    }
+
+    /// The repository name (`owner/name`) this PR belongs to, or `"unknown"`.
+    pub fn repo(&self) -> String {
+        let Some(url) = self.repository_url.as_deref() else {
+            return "unknown".to_string();
+        };
+        let mut parts = url.trim_end_matches('/').rsplit('/');
+        let name = parts.next().unwrap_or("unknown");
+        let owner = parts.next().unwrap_or("unknown");
+        format!("{owner}/{name}")
+    }
+}
+
+/// The `pull_request` object embedded in search API results.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestMetadata {
+    #[serde(default)]
+    pub merged_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -133,5 +214,43 @@ mod tests {
         .unwrap();
         assert!(pr.is_pull_request());
         assert_eq!(pr.author(), "octocat");
+    }
+
+    #[test]
+    fn pull_request_effective_state_distinguishes_merged() {
+        let open: PullRequest =
+            serde_json::from_str(r#"{"number":1,"title":"t","state":"open","merged_at":null}"#)
+                .unwrap();
+        assert_eq!(open.effective_state(), "open");
+        assert!(!open.is_merged());
+
+        let merged: PullRequest = serde_json::from_str(
+            r#"{"number":2,"title":"t","state":"closed","merged_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(merged.effective_state(), "merged");
+        assert!(merged.is_merged());
+
+        let closed: PullRequest =
+            serde_json::from_str(r#"{"number":3,"title":"t","state":"closed","merged_at":null}"#)
+                .unwrap();
+        assert_eq!(closed.effective_state(), "closed");
+        assert!(!closed.is_merged());
+    }
+
+    #[test]
+    fn searched_pull_request_parses_repo_from_url() {
+        let pr: SearchedPullRequest = serde_json::from_str(
+            r#"{
+                "number": 7,
+                "title": "add tests",
+                "state": "closed",
+                "repository_url": "https://api.github.com/repos/octocat/Hello-World",
+                "pull_request": {"merged_at": "2024-01-01T00:00:00Z"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(pr.repo(), "octocat/Hello-World");
+        assert_eq!(pr.effective_state(), "merged");
     }
 }
