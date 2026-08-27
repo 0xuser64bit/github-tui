@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 
 use crate::app::{App, Load, Screen, Tab};
-use crate::models::{Issue, PullRequest, Repo};
+use crate::models::{Issue, PullRequest, Repo, SearchedPullRequest};
 
 const ACCENT: Color = Color::Cyan;
 const OPEN: Color = Color::Green;
@@ -49,6 +49,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         match app.screen {
             Screen::Repos => render_repos(frame, app, body_area),
             Screen::RepoDetail => render_detail(frame, app, body_area),
+            Screen::MyPulls => render_my_pulls(frame, app, body_area),
         }
     }
 
@@ -85,6 +86,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 Tab::Pulls => "Pull Requests",
             }));
         }
+        Screen::MyPulls => spans.push(Span::raw("My Pull Requests")),
     }
 
     frame.render_widget(
@@ -198,6 +200,41 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+fn render_my_pulls(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered()
+        .border_style(Style::new().dim())
+        .title(Line::from(" My Pull Requests "));
+
+    match &app.my_pulls {
+        Load::Idle | Load::Loading => {
+            render_status_box(frame, area, block, &loading(app, "pull requests"))
+        }
+        Load::Failed(message) => render_status_box(frame, area, block, &failure(message)),
+        Load::Loaded(items) if items.is_empty() => {
+            render_status_box(frame, area, block, &Text::from("No pull requests found."))
+        }
+        Load::Loaded(items) => {
+            if app.filtered_my_pulls.is_empty() {
+                render_status_box(
+                    frame,
+                    area,
+                    block,
+                    &Text::from("No matching pull requests."),
+                );
+            } else {
+                let filtered: Vec<ListItem> = app
+                    .filtered_my_pulls
+                    .iter()
+                    .filter_map(|&i| items.get(i))
+                    .map(searched_pull_item)
+                    .collect();
+                let list = list_widget(filtered, block);
+                frame.render_stateful_widget(list, area, &mut app.my_pulls_state);
+            }
+        }
+    }
+}
+
 fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let titles = [
         format!(" Issues {} ", count_badge(&app.issues)),
@@ -237,10 +274,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.screen {
             Screen::Repos => {
-                " ↑↓ move · enter open · / search · o browser · r refresh · ? help · q quit"
+                " ↑↓ move · enter open · m my PRs · / search · o browser · r refresh · ? help · q quit"
             }
             Screen::RepoDetail => {
                 " ↑↓ move · tab switch · / search · enter/o browser · esc back · r refresh · q quit"
+            }
+            Screen::MyPulls => {
+                " ↑↓ move · / search · enter/o browser · esc back · r refresh · ? help · q quit"
             }
         }
     };
@@ -287,6 +327,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("Enter / l / →", "Open repo (or issue/PR in browser)"),
         ("Esc / h / ←", "Back to repository list"),
         ("Tab", "Switch Issues / Pull Requests"),
+        ("m", "View your pull requests"),
         ("/", "Search / filter the current list"),
         ("o", "Open current selection in browser"),
         ("r", "Refresh the current view"),
@@ -349,9 +390,9 @@ fn repo_item(repo: &Repo) -> ListItem<'static> {
 }
 
 fn issue_item(issue: &Issue) -> ListItem<'static> {
-    let open = issue.state == "open";
+    let state = issue.state.as_str();
     ListItem::new(Line::from(vec![
-        state_dot(open),
+        state_dot(state),
         Span::styled(format!("#{:<5} ", issue.number), Style::new().dim()),
         Span::raw(issue.title.clone()),
         Span::styled(
@@ -362,9 +403,9 @@ fn issue_item(issue: &Issue) -> ListItem<'static> {
 }
 
 fn pull_item(pr: &PullRequest) -> ListItem<'static> {
-    let open = pr.state == "open";
+    let state = pr.effective_state();
     let mut spans = vec![
-        state_dot(open),
+        state_dot(state),
         Span::styled(format!("#{:<5} ", pr.number), Style::new().dim()),
         Span::raw(pr.title.clone()),
     ];
@@ -378,8 +419,29 @@ fn pull_item(pr: &PullRequest) -> ListItem<'static> {
     ListItem::new(Line::from(spans))
 }
 
-fn state_dot(open: bool) -> Span<'static> {
-    let color = if open { OPEN } else { CLOSED };
+fn searched_pull_item(pr: &SearchedPullRequest) -> ListItem<'static> {
+    let state = pr.effective_state();
+    let mut spans = vec![
+        state_dot(state),
+        Span::styled(format!("#{:<5} ", pr.number), Style::new().dim()),
+        Span::raw(pr.title.clone()),
+    ];
+    if pr.draft {
+        spans.push(Span::styled(" [draft]", Style::new().fg(Color::DarkGray)));
+    }
+    spans.push(Span::styled(
+        format!("  {} · {}", pr.repo(), pr.author()),
+        Style::new().dim(),
+    ));
+    ListItem::new(Line::from(spans))
+}
+
+fn state_dot(state: &str) -> Span<'static> {
+    let color = match state {
+        "open" => OPEN,
+        "merged" => Color::Cyan,
+        _ => CLOSED,
+    };
     Span::styled("● ", Style::new().fg(color))
 }
 
@@ -539,6 +601,7 @@ mod tests {
             user: Some(User {
                 login: "hubber".to_string(),
             }),
+            merged_at: None,
         }]);
         app.refilter();
 

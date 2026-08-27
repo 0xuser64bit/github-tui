@@ -17,7 +17,7 @@ use ratatui::widgets::ListState;
 
 use crate::event::{Event, Events, Message};
 use crate::github::Github;
-use crate::models::{Issue, PullRequest, Repo, User};
+use crate::models::{Issue, PullRequest, Repo, SearchedPullRequest, User};
 use crate::ui;
 
 /// The async loading state of a piece of remote data.
@@ -61,6 +61,7 @@ impl<U> Load<Vec<U>> {
 pub enum Screen {
     Repos,
     RepoDetail,
+    MyPulls,
 }
 
 /// Which tab of the repo-detail screen is active.
@@ -91,6 +92,8 @@ pub struct App {
     pub(crate) issues_state: ListState,
     pub(crate) pulls: Load<Vec<PullRequest>>,
     pub(crate) pulls_state: ListState,
+    pub(crate) my_pulls: Load<Vec<SearchedPullRequest>>,
+    pub(crate) my_pulls_state: ListState,
 
     pub(crate) show_help: bool,
     pub(crate) status: Option<String>,
@@ -106,6 +109,8 @@ pub struct App {
     pub(crate) filtered_issues: Vec<usize>,
     /// Indices into the loaded pulls that match the current query.
     pub(crate) filtered_pulls: Vec<usize>,
+    /// Indices into the loaded global "my pulls" that match the current query.
+    pub(crate) filtered_my_pulls: Vec<usize>,
 }
 
 impl App {
@@ -126,6 +131,8 @@ impl App {
             issues_state: ListState::default(),
             pulls: Load::Idle,
             pulls_state: ListState::default(),
+            my_pulls: Load::Idle,
+            my_pulls_state: ListState::default(),
             show_help: false,
             status: None,
             spinner: 0,
@@ -134,6 +141,7 @@ impl App {
             filtered_repos: Vec::new(),
             filtered_issues: Vec::new(),
             filtered_pulls: Vec::new(),
+            filtered_my_pulls: Vec::new(),
         }
     }
 
@@ -228,6 +236,7 @@ impl App {
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('o') => self.open_selected_in_browser(),
             KeyCode::Char('/') => self.enter_search(),
+            KeyCode::Char('m') => self.open_my_pulls(),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Home | KeyCode::Char('g') => self.move_to_edge(true),
@@ -241,7 +250,14 @@ impl App {
 
     fn on_message(&mut self, message: Message) {
         match message {
-            Message::User(result) => self.user = result.into(),
+            Message::User(result) => {
+                self.user = result.into();
+                // The user may have opened My Pull Requests before the initial
+                // /user fetch resolved; kick off the PR fetch once login is known.
+                if self.screen == Screen::MyPulls && matches!(self.my_pulls, Load::Idle) {
+                    self.fetch_my_pulls();
+                }
+            }
             Message::Repos(result) => {
                 self.repos = result.into();
                 self.refilter();
@@ -261,17 +277,22 @@ impl App {
                     Self::select_first(&mut self.pulls_state, self.filtered_pulls.len());
                 }
             }
+            Message::MyPulls(result) => {
+                self.my_pulls = result.into();
+                self.refilter();
+                Self::select_first(&mut self.my_pulls_state, self.filtered_my_pulls.len());
+            }
         }
     }
 
     // --- actions -----------------------------------------------------------
 
-    /// Enter: on the repo list open the detail view; in detail, open the
-    /// selected issue/PR in a browser.
+    /// Enter: on the repo list open the detail view; in detail or the global
+    /// pull-request list, open the selected item in a browser.
     fn activate_selection(&mut self) {
         match self.screen {
             Screen::Repos => self.open_selected_repo(),
-            Screen::RepoDetail => self.open_selected_in_browser(),
+            Screen::RepoDetail | Screen::MyPulls => self.open_selected_in_browser(),
         }
     }
 
@@ -292,10 +313,17 @@ impl App {
     }
 
     fn go_back(&mut self) {
-        if self.screen == Screen::RepoDetail {
-            self.screen = Screen::Repos;
-            self.active_repo = None;
-            self.clear_search();
+        match self.screen {
+            Screen::RepoDetail => {
+                self.screen = Screen::Repos;
+                self.active_repo = None;
+                self.clear_search();
+            }
+            Screen::MyPulls => {
+                self.screen = Screen::Repos;
+                self.clear_search();
+            }
+            Screen::Repos => {}
         }
     }
 
@@ -317,6 +345,7 @@ impl App {
                     self.fetch_pulls(&repo);
                 }
             }
+            Screen::MyPulls => self.fetch_my_pulls(),
         }
     }
 
@@ -328,6 +357,18 @@ impl App {
             Ok(()) => self.status = Some(format!("Opening {url}")),
             Err(_) => self.status = Some("Could not launch a browser.".to_string()),
         }
+    }
+
+    fn open_my_pulls(&mut self) {
+        self.screen = Screen::MyPulls;
+        self.active_repo = None;
+        self.my_pulls = Load::Idle;
+        self.my_pulls_state.select(None);
+        self.clear_search();
+        if self.user_login().is_some() {
+            self.fetch_my_pulls();
+        }
+        // Otherwise the /user response triggers the fetch in on_message.
     }
 
     // --- selection helpers -------------------------------------------------
@@ -355,6 +396,7 @@ impl App {
                 Tab::Issues => (&mut self.issues_state, self.filtered_issues.len()),
                 Tab::Pulls => (&mut self.pulls_state, self.filtered_pulls.len()),
             },
+            Screen::MyPulls => (&mut self.my_pulls_state, self.filtered_my_pulls.len()),
         }
     }
 
@@ -404,6 +446,21 @@ impl App {
                     }
                 }
             }
+            Screen::MyPulls => {
+                let Load::Loaded(items) = &self.my_pulls else {
+                    return None;
+                };
+                let visible_idx = self.my_pulls_state.selected()?;
+                let real_idx = *self.filtered_my_pulls.get(visible_idx)?;
+                let pr = items.get(real_idx)?;
+                pr.html_url.clone().or_else(|| {
+                    Some(format!(
+                        "https://github.com/{}/pull/{}",
+                        pr.repo(),
+                        pr.number
+                    ))
+                })
+            }
         }
     }
 
@@ -438,6 +495,7 @@ impl App {
         self.filtered_repos.clear();
         self.filtered_issues.clear();
         self.filtered_pulls.clear();
+        self.filtered_my_pulls.clear();
         self.refilter();
     }
 
@@ -493,6 +551,23 @@ impl App {
             self.filtered_pulls.clear();
         }
 
+        // Global "my pulls"
+        if let Load::Loaded(pulls) = &self.my_pulls {
+            self.filtered_my_pulls = pulls
+                .iter()
+                .enumerate()
+                .filter(|(_, pr)| {
+                    query.is_empty()
+                        || pr.title.to_lowercase().contains(&query)
+                        || pr.repo().to_lowercase().contains(&query)
+                        || pr.author().to_lowercase().contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect();
+        } else {
+            self.filtered_my_pulls.clear();
+        }
+
         // Clamp cursor for the active list.
         let (state, len) = match self.screen {
             Screen::Repos => (&mut self.repos_state, self.filtered_repos.len()),
@@ -500,6 +575,7 @@ impl App {
                 Tab::Issues => (&mut self.issues_state, self.filtered_issues.len()),
                 Tab::Pulls => (&mut self.pulls_state, self.filtered_pulls.len()),
             },
+            Screen::MyPulls => (&mut self.my_pulls_state, self.filtered_my_pulls.len()),
         };
         if len == 0 {
             state.select(None);
@@ -558,6 +634,29 @@ impl App {
             let result = client.list_pulls(&owner, &name);
             let _ = sender.send(Event::Message(Message::Pulls { repo: full, result }));
         });
+    }
+
+    fn fetch_my_pulls(&mut self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(login) = self.user_login() else {
+            self.my_pulls = Load::Failed("Authenticated user not loaded yet.".to_string());
+            return;
+        };
+        self.my_pulls = Load::Loading;
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let _ = sender.send(Event::Message(Message::MyPulls(client.my_pulls(&login))));
+        });
+    }
+
+    /// The authenticated login, used to query the user's own PRs.
+    fn user_login(&self) -> Option<String> {
+        match &self.user {
+            Load::Loaded(user) => Some(user.login.clone()),
+            _ => None,
+        }
     }
 }
 

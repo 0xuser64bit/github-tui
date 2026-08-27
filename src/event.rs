@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{self as terminal, Event as TerminalEvent};
 
-use crate::models::{Issue, PullRequest, Repo, User};
+use crate::models::{Issue, PullRequest, Repo, SearchedPullRequest, User};
 
 /// How often the spinner advances while something is loading.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
@@ -34,6 +34,7 @@ pub enum Message {
         repo: String,
         result: Result<Vec<PullRequest>, String>,
     },
+    MyPulls(Result<Vec<SearchedPullRequest>, String>),
 }
 
 /// Anything the main loop reacts to.
