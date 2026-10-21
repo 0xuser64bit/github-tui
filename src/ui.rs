@@ -17,31 +17,67 @@ const CLOSED: Color = Color::Magenta;
 /// Entry point: lay out header / body / footer and draw the active screen.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-
-    let (header_area, search_area, body_area, footer_area) = if app.search_active {
-        let chunks = Layout::vertical([
-            Constraint::Length(1), // header
-            Constraint::Length(1), // search bar
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
-        (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+    let progress = app.progress();
+    let mut notices = Vec::new();
+    let actions = if app.search_active {
+        "Esc then r refresh"
     } else {
-        let chunks = Layout::vertical([
-            Constraint::Length(1), // header
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
-        (chunks[0], None, chunks[1], chunks[2])
+        "r refresh"
     };
+    if progress.error.is_some() {
+        notices.push(if progress.next.is_some() {
+            format!("{actions}; n load next page")
+        } else {
+            actions.to_string()
+        });
+    } else if progress.next.is_some() && !progress.loading() {
+        notices.push(
+            if app.search_active {
+                "Esc then n: load next page"
+            } else {
+                "n: load next page"
+            }
+            .to_string(),
+        );
+    }
+    if let Some(error) = &progress.error {
+        notices.push(format!("{error} Loaded rows retained."));
+    }
+    if let Some(warning) = &progress.warning {
+        notices.push(warning.clone());
+    }
+    if progress.loading() {
+        notices.push(format!("{} Fetching…", app.spinner()));
+    } else if progress.next.is_some() {
+        notices.push("More results available. Search filters loaded rows.".to_string());
+    }
+    let notice = notices.join("\n");
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(app.search_active)),
+        Constraint::Min(0),
+        Constraint::Length(if notice.is_empty() {
+            0
+        } else {
+            notices.len().min(4) as u16 + 1
+        }),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let (header_area, body_area, footer_area) = (chunks[0], chunks[2], chunks[4]);
 
     render_header(frame, app, header_area);
 
-    if let Some(search_area) = search_area {
-        render_search_bar(frame, app, search_area);
+    if app.search_active {
+        render_search_bar(frame, app, chunks[1]);
     }
+
+    frame.render_widget(
+        Paragraph::new(notice)
+            .wrap(Wrap { trim: false })
+            .style(Style::new().fg(Color::Yellow)),
+        chunks[3],
+    );
 
     if app.needs_auth() {
         render_auth_required(frame, body_area);
@@ -117,6 +153,14 @@ fn render_repos(frame: &mut Frame, app: &mut App, area: Rect) {
             render_status_box(frame, area, block, &loading(app, "repositories"))
         }
         Load::Failed(message) => render_status_box(frame, area, block, &failure(message)),
+        Load::Loaded(repos) if repos.is_empty() && app.repos_progress.next.is_some() => {
+            render_status_box(
+                frame,
+                area,
+                block,
+                &Text::from("No repositories on this page. More results are available."),
+            )
+        }
         Load::Loaded(repos) if repos.is_empty() => {
             render_status_box(frame, area, block, &Text::from("No repositories found."))
         }
@@ -151,6 +195,14 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 render_status_box(frame, rows[1], block, &loading(app, "issues"))
             }
             Load::Failed(message) => render_status_box(frame, rows[1], block, &failure(message)),
+            Load::Loaded(items) if items.is_empty() && app.issues_progress.next.is_some() => {
+                render_status_box(
+                    frame,
+                    rows[1],
+                    block,
+                    &Text::from("No issues on this page. More results are available."),
+                )
+            }
             Load::Loaded(items) if items.is_empty() => {
                 render_status_box(frame, rows[1], block, &Text::from("No issues."))
             }
@@ -174,6 +226,14 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 render_status_box(frame, rows[1], block, &loading(app, "pull requests"))
             }
             Load::Failed(message) => render_status_box(frame, rows[1], block, &failure(message)),
+            Load::Loaded(items) if items.is_empty() && app.pulls_progress.next.is_some() => {
+                render_status_box(
+                    frame,
+                    rows[1],
+                    block,
+                    &Text::from("No pull requests on this page. More results are available."),
+                )
+            }
             Load::Loaded(items) if items.is_empty() => {
                 render_status_box(frame, rows[1], block, &Text::from("No pull requests."))
             }
@@ -210,6 +270,14 @@ fn render_my_pulls(frame: &mut Frame, app: &mut App, area: Rect) {
             render_status_box(frame, area, block, &loading(app, "pull requests"))
         }
         Load::Failed(message) => render_status_box(frame, area, block, &failure(message)),
+        Load::Loaded(items) if items.is_empty() && app.my_pulls_progress.next.is_some() => {
+            render_status_box(
+                frame,
+                area,
+                block,
+                &Text::from("No pull requests on this page. More results are available."),
+            )
+        }
         Load::Loaded(items) if items.is_empty() => {
             render_status_box(frame, area, block, &Text::from("No pull requests found."))
         }
@@ -322,7 +390,7 @@ fn render_auth_required(frame: &mut Frame, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(area, 56, 17);
+    let popup = centered_rect(area, 64, 18);
     frame.render_widget(Clear, popup);
 
     let rows = [
@@ -335,6 +403,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("/", "Search / filter the current list"),
         ("o", "Open current selection in browser"),
         ("r", "Refresh the current view"),
+        ("n", "Load the next page (keeps loaded rows)"),
         ("?", "Toggle this help"),
         ("q / Ctrl-C", "Quit"),
     ];
@@ -487,7 +556,7 @@ fn failure(message: &str) -> Text<'static> {
 
 fn count_badge<T>(load: &Load<Vec<T>>) -> String {
     match load {
-        Load::Loaded(items) => format!("({})", items.len()),
+        Load::Loaded(items) => format!("({} loaded)", items.len()),
         Load::Loading => "(…)".to_string(),
         _ => String::new(),
     }
@@ -733,5 +802,36 @@ mod tests {
                 app.show_help = false;
             }
         }
+    }
+    #[test]
+    fn pagination_failure_keeps_rows_and_visible_recovery_actions() {
+        let mut app = authed_app();
+        app.repos = Load::Loaded(vec![sample_repo()]);
+        app.refilter();
+        app.repos_progress.error =
+            Some("A long network error that should never hide the recovery controls".to_string());
+        let text = rendered(&mut app, 24, 14);
+        assert!(text.contains("r refresh"));
+        assert!(!text.contains("n load next page"));
+        assert!(text.contains("user-64bit/github"));
+        app.repos_progress.next = Some("https://api.github.com/user/repos?page=2".to_string());
+        assert!(rendered(&mut app, 80, 24).contains("n load next page"));
+        app.search_active = true;
+        assert!(rendered(&mut app, 80, 24).contains("Esc then r refresh"));
+    }
+
+    #[test]
+    fn incomplete_search_and_empty_continuation_are_visible() {
+        let mut app = authed_app();
+        app.screen = Screen::MyPulls;
+        app.my_pulls = Load::Loaded(vec![]);
+        app.my_pulls_progress.next =
+            Some("https://api.github.com/search/issues?page=2".to_string());
+        app.my_pulls_progress.warning =
+            Some("GitHub Search timed out; this list may be incomplete.".to_string());
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("No pull requests on this page"));
+        assert!(text.contains("incomplete"));
+        assert!(text.contains("n: load next page"));
     }
 }

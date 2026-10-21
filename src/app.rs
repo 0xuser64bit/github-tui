@@ -1,10 +1,11 @@
 //! Application state and the main loop.
 //!
-//! The app is a small state machine over two screens (repository list and a
-//! per-repository detail with Issues/Pulls tabs). All network work is dispatched
+//! The app is a state machine over repository, detail, and personal PR screens.
+//! All network work is dispatched
 //! to worker threads; results arrive as [`Message`]s and update the relevant
 //! [`Load`] field. The UI thread only ever reads state and draws.
 
+use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -16,7 +17,7 @@ use ratatui::crossterm::event::{
 use ratatui::widgets::ListState;
 
 use crate::event::{Event, Events, Message};
-use crate::github::Github;
+use crate::github::{Github, Page};
 use crate::models::{Issue, PullRequest, Repo, SearchedPullRequest, User};
 use crate::ui;
 
@@ -53,6 +54,105 @@ impl<U> Load<Vec<U>> {
     /// True when there are no loaded items (including while idle/loading/failed).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[derive(Default)]
+struct Request {
+    generation: u64,
+    in_flight: bool,
+}
+
+impl Request {
+    fn start(&mut self) -> Option<u64> {
+        if self.in_flight {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.in_flight = true;
+        Some(self.generation)
+    }
+
+    fn finish(&mut self, generation: u64) -> bool {
+        if !self.in_flight || generation != self.generation {
+            return false;
+        }
+        self.in_flight = false;
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.in_flight = false;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ListProgress {
+    request: Request,
+    pub(crate) next: Option<String>,
+    pub(crate) warning: Option<String>,
+    pub(crate) error: Option<String>,
+    cursor: Option<String>,
+    completed: HashSet<String>,
+}
+
+impl ListProgress {
+    pub(crate) fn loading(&self) -> bool {
+        self.request.in_flight
+    }
+
+    fn start(&mut self, more: bool) -> Option<(u64, Option<String>)> {
+        let cursor = if more { Some(self.next.clone()?) } else { None };
+        let generation = self.request.start()?;
+        self.cursor = cursor.clone();
+        self.error = None;
+        Some((generation, cursor))
+    }
+
+    fn finish<T, K: Eq + std::hash::Hash>(
+        &mut self,
+        generation: u64,
+        result: Result<Page<T>, String>,
+        load: &mut Load<Vec<T>>,
+        key: impl Fn(&T) -> K,
+    ) -> bool {
+        if !self.request.finish(generation) {
+            return false;
+        }
+        match result {
+            Ok(page) => {
+                if let Some(cursor) = self.cursor.take() {
+                    self.completed.insert(cursor);
+                    if let Load::Loaded(items) = load {
+                        let mut seen: HashSet<_> = items.iter().map(&key).collect();
+                        items.extend(page.items.into_iter().filter(|item| seen.insert(key(item))));
+                    } else {
+                        *load = Load::Loaded(page.items);
+                    }
+                    if page.warning.is_some() {
+                        self.warning = page.warning;
+                    }
+                } else {
+                    self.completed.clear();
+                    *load = Load::Loaded(page.items);
+                    self.warning = page.warning;
+                }
+                self.next = page.next;
+                if self
+                    .next
+                    .as_ref()
+                    .is_some_and(|next| self.completed.contains(next))
+                {
+                    self.next = None;
+                    self.error =
+                        Some("GitHub repeated a pagination link. Refresh to retry.".to_string());
+                }
+            }
+            Err(error) if matches!(load, Load::Loaded(_)) => self.error = Some(error),
+            Err(error) => *load = Load::Failed(error),
+        }
+        true
     }
 }
 
@@ -98,6 +198,11 @@ pub struct App {
     pub(crate) show_help: bool,
     pub(crate) status: Option<String>,
     spinner: usize,
+    user_request: Request,
+    pub(crate) repos_progress: ListProgress,
+    pub(crate) issues_progress: ListProgress,
+    pub(crate) pulls_progress: ListProgress,
+    pub(crate) my_pulls_progress: ListProgress,
 
     /// Whether the search input bar is active.
     pub(crate) search_active: bool,
@@ -136,6 +241,11 @@ impl App {
             show_help: false,
             status: None,
             spinner: 0,
+            user_request: Request::default(),
+            repos_progress: ListProgress::default(),
+            issues_progress: ListProgress::default(),
+            pulls_progress: ListProgress::default(),
+            my_pulls_progress: ListProgress::default(),
             search_active: false,
             search_query: String::new(),
             filtered_repos: Vec::new(),
@@ -149,15 +259,31 @@ impl App {
     pub fn run(mut self, mut terminal: DefaultTerminal, events: Events) -> color_eyre::Result<()> {
         self.running = true;
         self.bootstrap();
+        let mut redraw = true;
         while self.running {
-            terminal.draw(|frame| ui::render(frame, &mut self))?;
-            match events.next()? {
-                Event::Terminal(event) => self.on_terminal(event),
-                Event::Message(message) => self.on_message(message),
-                Event::Tick => self.spinner = self.spinner.wrapping_add(1),
+            if redraw {
+                terminal.draw(|frame| ui::render(frame, &mut self))?;
             }
+            redraw = self.on_event(events.next()?)?;
         }
         Ok(())
+    }
+
+    fn on_event(&mut self, event: Event) -> color_eyre::Result<bool> {
+        match event {
+            Event::Terminal(event) => self.on_terminal(event),
+            Event::Message(message) => self.on_message(message),
+            Event::InputFailed(error) => return Err(error.into()),
+            Event::Tick => {
+                if !self.progress().loading()
+                    && !(self.screen == Screen::MyPulls && self.user_request.in_flight)
+                {
+                    return Ok(false);
+                }
+                self.spinner = self.spinner.wrapping_add(1);
+            }
+        }
+        Ok(true)
     }
 
     /// True when no token was available, so nothing can be fetched.
@@ -174,17 +300,17 @@ impl App {
     fn bootstrap(&mut self) {
         if self.client.is_some() {
             self.fetch_user();
-            self.fetch_repos();
+            self.fetch_repos(false);
         }
     }
 
     // --- event handling ----------------------------------------------------
 
     fn on_terminal(&mut self, event: TerminalEvent) {
-        if let TerminalEvent::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                self.on_key(key);
-            }
+        if let TerminalEvent::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            self.on_key(key);
         }
         // Resize/mouse need no handling: the loop redraws after every event.
     }
@@ -234,6 +360,7 @@ impl App {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('n') => self.load_more(),
             KeyCode::Char('o') => self.open_selected_in_browser(),
             KeyCode::Char('/') => self.enter_search(),
             KeyCode::Char('m') => self.open_my_pulls(),
@@ -249,39 +376,54 @@ impl App {
     }
 
     fn on_message(&mut self, message: Message) {
-        match message {
-            Message::User(result) => {
+        let updated = match message {
+            Message::User { request, result } => {
+                if !self.user_request.finish(request) {
+                    return;
+                }
                 self.user = result.into();
-                // The user may have opened My Pull Requests before the initial
-                // /user fetch resolved; kick off the PR fetch once login is known.
                 if self.screen == Screen::MyPulls && matches!(self.my_pulls, Load::Idle) {
-                    self.fetch_my_pulls();
+                    if let Load::Failed(message) = &self.user {
+                        self.my_pulls =
+                            Load::Failed(format!("Could not load your account: {message}"));
+                    } else {
+                        self.fetch_my_pulls(false);
+                    }
                 }
+                false
             }
-            Message::Repos(result) => {
-                self.repos = result.into();
-                self.refilter();
-                Self::select_first(&mut self.repos_state, self.filtered_repos.len());
+            Message::Repos { request, result } => {
+                self.repos_progress
+                    .finish(request, result, &mut self.repos, |repo| {
+                        repo.full_name.clone()
+                    })
             }
-            Message::Issues { repo, result } => {
-                if self.is_active_repo(&repo) {
-                    self.issues = result.into();
-                    self.refilter();
-                    Self::select_first(&mut self.issues_state, self.filtered_issues.len());
-                }
+            Message::Issues {
+                request,
+                repo,
+                result,
+            } if self.is_active_repo(&repo) => {
+                self.issues_progress
+                    .finish(request, result, &mut self.issues, |issue| issue.number)
             }
-            Message::Pulls { repo, result } => {
-                if self.is_active_repo(&repo) {
-                    self.pulls = result.into();
-                    self.refilter();
-                    Self::select_first(&mut self.pulls_state, self.filtered_pulls.len());
-                }
+            Message::Pulls {
+                request,
+                repo,
+                result,
+            } if self.is_active_repo(&repo) => {
+                self.pulls_progress
+                    .finish(request, result, &mut self.pulls, |pr| pr.number)
             }
-            Message::MyPulls(result) => {
-                self.my_pulls = result.into();
-                self.refilter();
-                Self::select_first(&mut self.my_pulls_state, self.filtered_my_pulls.len());
+            Message::MyPulls { request, result } => {
+                self.my_pulls_progress
+                    .finish(request, result, &mut self.my_pulls, |pr| {
+                        (pr.repo(), pr.number)
+                    })
             }
+            _ => false,
+        };
+        if updated {
+            self.refilter();
         }
     }
 
@@ -303,13 +445,23 @@ impl App {
         self.active_repo = Some(repo.clone());
         self.screen = Screen::RepoDetail;
         self.tab = Tab::Issues;
+        self.issues_progress.request.invalidate();
+        self.pulls_progress.request.invalidate();
+        self.issues_progress = ListProgress {
+            request: std::mem::take(&mut self.issues_progress.request),
+            ..ListProgress::default()
+        };
+        self.pulls_progress = ListProgress {
+            request: std::mem::take(&mut self.pulls_progress.request),
+            ..ListProgress::default()
+        };
         self.issues = Load::Idle;
         self.pulls = Load::Idle;
         self.issues_state.select(None);
         self.pulls_state.select(None);
         self.clear_search();
-        self.fetch_issues(&repo);
-        self.fetch_pulls(&repo);
+        self.fetch_issues(&repo, false);
+        self.fetch_pulls(&repo, false);
     }
 
     fn go_back(&mut self) {
@@ -317,6 +469,8 @@ impl App {
             Screen::RepoDetail => {
                 self.screen = Screen::Repos;
                 self.active_repo = None;
+                self.issues_progress.request.invalidate();
+                self.pulls_progress.request.invalidate();
                 self.clear_search();
             }
             Screen::MyPulls => {
@@ -333,19 +487,20 @@ impl App {
                 Tab::Issues => Tab::Pulls,
                 Tab::Pulls => Tab::Issues,
             };
+            self.refilter();
         }
     }
 
     fn refresh(&mut self) {
         match self.screen {
-            Screen::Repos => self.fetch_repos(),
+            Screen::Repos => self.fetch_repos(false),
             Screen::RepoDetail => {
                 if let Some(repo) = self.active_repo.clone() {
-                    self.fetch_issues(&repo);
-                    self.fetch_pulls(&repo);
+                    self.fetch_issues(&repo, false);
+                    self.fetch_pulls(&repo, false);
                 }
             }
-            Screen::MyPulls => self.fetch_my_pulls(),
+            Screen::MyPulls => self.fetch_my_pulls(false),
         }
     }
 
@@ -362,13 +517,12 @@ impl App {
     fn open_my_pulls(&mut self) {
         self.screen = Screen::MyPulls;
         self.active_repo = None;
-        self.my_pulls = Load::Idle;
-        self.my_pulls_state.select(None);
+        self.issues_progress.request.invalidate();
+        self.pulls_progress.request.invalidate();
         self.clear_search();
-        if self.user_login().is_some() {
-            self.fetch_my_pulls();
+        if !matches!(self.my_pulls, Load::Loaded(_) | Load::Loading) {
+            self.fetch_my_pulls(false);
         }
-        // Otherwise the /user response triggers the fetch in on_message.
     }
 
     // --- selection helpers -------------------------------------------------
@@ -468,10 +622,6 @@ impl App {
         self.active_repo
             .as_ref()
             .is_some_and(|repo| repo.full_name == full_name)
-    }
-
-    fn select_first(state: &mut ListState, len: usize) {
-        state.select((len > 0).then_some(0));
     }
 
     // --- search / filter ---------------------------------------------------
@@ -590,72 +740,134 @@ impl App {
         let Some(client) = self.client.clone() else {
             return;
         };
+        let Some(request) = self.user_request.start() else {
+            return;
+        };
         self.user = Load::Loading;
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let _ = sender.send(Event::Message(Message::User(client.current_user())));
+            let _ = sender.send(Event::Message(Message::User {
+                request,
+                result: client.current_user(),
+            }));
         });
     }
 
-    fn fetch_repos(&mut self) {
+    fn fetch_repos(&mut self, more: bool) {
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.repos = Load::Loading;
+        let Some((request, next)) = self.repos_progress.start(more) else {
+            return;
+        };
+        if !matches!(self.repos, Load::Loaded(_)) {
+            self.repos = Load::Loading;
+        }
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let _ = sender.send(Event::Message(Message::Repos(client.list_repos())));
+            let result = client.repos_page(next.as_deref());
+            let _ = sender.send(Event::Message(Message::Repos { request, result }));
         });
     }
 
-    fn fetch_issues(&mut self, repo: &Repo) {
+    fn fetch_issues(&mut self, repo: &Repo, more: bool) {
         let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some((request, next)) = self.issues_progress.start(more) else {
             return;
         };
         let (owner, name) = repo.owner_repo();
         let (owner, name, full) = (owner.to_string(), name.to_string(), repo.full_name.clone());
-        self.issues = Load::Loading;
+        if !matches!(self.issues, Load::Loaded(_)) {
+            self.issues = Load::Loading;
+        }
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let result = client.list_issues(&owner, &name);
-            let _ = sender.send(Event::Message(Message::Issues { repo: full, result }));
+            let result = client.issues_page(&owner, &name, next.as_deref());
+            let _ = sender.send(Event::Message(Message::Issues {
+                request,
+                repo: full,
+                result,
+            }));
         });
     }
 
-    fn fetch_pulls(&mut self, repo: &Repo) {
+    fn fetch_pulls(&mut self, repo: &Repo, more: bool) {
         let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some((request, next)) = self.pulls_progress.start(more) else {
             return;
         };
         let (owner, name) = repo.owner_repo();
         let (owner, name, full) = (owner.to_string(), name.to_string(), repo.full_name.clone());
-        self.pulls = Load::Loading;
+        if !matches!(self.pulls, Load::Loaded(_)) {
+            self.pulls = Load::Loading;
+        }
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let result = client.list_pulls(&owner, &name);
-            let _ = sender.send(Event::Message(Message::Pulls { repo: full, result }));
+            let result = client.pulls_page(&owner, &name, next.as_deref());
+            let _ = sender.send(Event::Message(Message::Pulls {
+                request,
+                repo: full,
+                result,
+            }));
         });
     }
 
-    fn fetch_my_pulls(&mut self) {
+    fn fetch_my_pulls(&mut self, more: bool) {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let Some(login) = self.user_login() else {
-            self.my_pulls = Load::Failed("Authenticated user not loaded yet.".to_string());
+        let login = match &self.user {
+            Load::Loaded(user) => user.login.clone(),
+            Load::Loading => {
+                self.my_pulls = Load::Idle;
+                return;
+            }
+            Load::Idle | Load::Failed(_) => {
+                self.my_pulls = Load::Idle;
+                self.fetch_user();
+                return;
+            }
+        };
+        let Some((request, next)) = self.my_pulls_progress.start(more) else {
             return;
         };
-        self.my_pulls = Load::Loading;
+        if !matches!(self.my_pulls, Load::Loaded(_)) {
+            self.my_pulls = Load::Loading;
+        }
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let _ = sender.send(Event::Message(Message::MyPulls(client.my_pulls(&login))));
+            let result = client.my_pulls_page(&login, next.as_deref());
+            let _ = sender.send(Event::Message(Message::MyPulls { request, result }));
         });
     }
 
-    /// The authenticated login, used to query the user's own PRs.
-    fn user_login(&self) -> Option<String> {
-        match &self.user {
-            Load::Loaded(user) => Some(user.login.clone()),
-            _ => None,
+    fn load_more(&mut self) {
+        match self.screen {
+            Screen::Repos => self.fetch_repos(true),
+            Screen::RepoDetail => {
+                if let Some(repo) = self.active_repo.clone() {
+                    match self.tab {
+                        Tab::Issues => self.fetch_issues(&repo, true),
+                        Tab::Pulls => self.fetch_pulls(&repo, true),
+                    }
+                }
+            }
+            Screen::MyPulls => self.fetch_my_pulls(true),
+        }
+    }
+
+    pub(crate) fn progress(&self) -> &ListProgress {
+        match self.screen {
+            Screen::Repos => &self.repos_progress,
+            Screen::RepoDetail => match self.tab {
+                Tab::Issues => &self.issues_progress,
+                Tab::Pulls => &self.pulls_progress,
+            },
+            Screen::MyPulls => &self.my_pulls_progress,
         }
     }
 }
@@ -706,6 +918,57 @@ fn browser_command(url: &str) -> Command {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    fn fixture_app(
+        bodies: Vec<&'static str>,
+    ) -> (App, mpsc::Receiver<Event>, thread::JoinHandle<()>, String) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        let client = Github::test_client(&root);
+        let server = thread::spawn(move || {
+            for body in bodies {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "fixture request never arrived");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fixture accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        (App::new(Some(client), tx), rx, server, root)
+    }
+
+    fn receive_message(app: &mut App, receiver: &mpsc::Receiver<Event>) {
+        let event = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let Event::Message(message) = event else {
+            panic!("expected fetch result")
+        };
+        app.on_message(message);
+    }
 
     fn test_app() -> App {
         let (tx, _rx) = mpsc::channel();
@@ -797,8 +1060,13 @@ mod tests {
         app.active_repo = Some(repo("current/repo"));
         // A result for a repo the user already left must be ignored.
         app.on_message(Message::Issues {
+            request: 1,
             repo: "old/repo".to_string(),
-            result: Ok(vec![]),
+            result: Ok(Page {
+                items: vec![],
+                next: None,
+                warning: None,
+            }),
         });
         assert!(matches!(app.issues, Load::Idle));
     }
@@ -957,6 +1225,391 @@ mod tests {
         assert_eq!(
             app.selected_url().as_deref(),
             Some("https://github.com/other/project/pull/6")
+        );
+    }
+
+    #[test]
+    fn my_pulls_retries_a_failed_account_lookup() {
+        let (mut app, rx, server, _) = fixture_app(vec![
+            r#"{"login":"octocat"}"#,
+            r#"{"total_count":0,"incomplete_results":false,"items":[]}"#,
+        ]);
+        app.user = Load::Failed("offline".to_string());
+        app.open_my_pulls();
+        assert!(matches!(app.user, Load::Loading));
+        assert!(matches!(app.my_pulls, Load::Idle));
+        receive_message(&mut app, &rx);
+        receive_message(&mut app, &rx);
+        assert!(matches!(app.my_pulls, Load::Loaded(_)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn my_pulls_refresh_waits_for_the_account_in_flight() {
+        let (mut app, rx, server, _) = fixture_app(vec![
+            r#"{"login":"octocat"}"#,
+            r#"{"total_count":0,"incomplete_results":false,"items":[]}"#,
+        ]);
+        app.fetch_user();
+        app.open_my_pulls();
+        app.refresh();
+        assert!(matches!(app.my_pulls, Load::Idle));
+        receive_message(&mut app, &rx);
+        receive_message(&mut app, &rx);
+        assert!(matches!(app.my_pulls, Load::Loaded(_)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn my_pulls_displays_the_account_failure() {
+        let mut app = test_app();
+        app.screen = Screen::MyPulls;
+        let request = app.user_request.start().unwrap();
+        app.on_message(Message::User {
+            request,
+            result: Err("offline".to_string()),
+        });
+        assert!(matches!(&app.my_pulls, Load::Failed(message) if message.contains("offline")));
+    }
+
+    fn page<T>(items: Vec<T>, next: Option<&str>) -> Page<T> {
+        Page {
+            items,
+            next: next.map(str::to_string),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn request_coalesces_until_completion_and_allows_retry() {
+        let mut request = Request::default();
+        let first = request.start().unwrap();
+        assert!(request.start().is_none());
+        assert!(!request.finish(first.wrapping_add(1)));
+        assert!(request.in_flight);
+        assert!(request.finish(first));
+        assert!(!request.finish(first));
+        let second = request.start().unwrap();
+        assert_ne!(first, second);
+        assert!(request.finish(second));
+    }
+
+    #[test]
+    fn repeated_refresh_keeps_one_request_and_the_loaded_selection() {
+        let (mut app, rx, server, _) =
+            fixture_app(vec![r#"[{"name":"new","full_name":"me/new"}]"#]);
+        app.repos = Load::Loaded(vec![repo("me/first"), repo("me/second")]);
+        app.refilter();
+        app.repos_state.select(Some(1));
+
+        app.refresh();
+        let request = app.repos_progress.request.generation;
+        app.refresh();
+        app.refresh();
+
+        assert_eq!(app.repos_progress.request.generation, request);
+        assert!(app.repos_progress.loading());
+        assert_eq!(app.repos.len(), 2);
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/second");
+        receive_message(&mut app, &rx);
+        assert!(!app.repos_progress.loading());
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/new");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn superseded_repo_results_do_not_clear_the_current_request() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("me/current")]);
+        app.refilter();
+        let (old, _) = app.repos_progress.start(false).unwrap();
+        app.repos_progress.request.invalidate();
+        let (current, _) = app.repos_progress.start(false).unwrap();
+
+        app.on_message(Message::Repos {
+            request: old,
+            result: Ok(page(vec![repo("me/stale")], None)),
+        });
+        app.on_message(Message::Repos {
+            request: old,
+            result: Err("old failure".to_string()),
+        });
+
+        assert!(app.repos_progress.loading());
+        assert_eq!(app.repos_progress.request.generation, current);
+        assert!(app.repos_progress.error.is_none());
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/current");
+        app.on_message(Message::Repos {
+            request: current,
+            result: Ok(page(vec![repo("me/new")], None)),
+        });
+        assert!(!app.repos_progress.loading());
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/new");
+    }
+
+    #[test]
+    fn superseded_user_results_leave_the_current_lookup_pending() {
+        let mut app = test_app();
+        app.screen = Screen::MyPulls;
+        app.user = Load::Loading;
+        let old = app.user_request.start().unwrap();
+        app.user_request.invalidate();
+        let current = app.user_request.start().unwrap();
+
+        app.on_message(Message::User {
+            request: old,
+            result: Ok(User {
+                login: "stale".to_string(),
+            }),
+        });
+        app.on_message(Message::User {
+            request: old,
+            result: Err("old failure".to_string()),
+        });
+
+        assert!(matches!(app.user, Load::Loading));
+        assert!(matches!(app.my_pulls, Load::Idle));
+        assert!(app.user_request.in_flight);
+        assert_eq!(app.user_request.generation, current);
+        app.on_message(Message::User {
+            request: current,
+            result: Err("current failure".to_string()),
+        });
+        assert!(!app.user_request.in_flight);
+        assert!(matches!(&app.my_pulls, Load::Failed(error) if error.contains("current failure")));
+    }
+
+    #[test]
+    fn reentering_the_same_repo_rejects_both_old_detail_results() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("me/project")]);
+        app.refilter();
+        app.open_selected_repo();
+        let (old_issues, _) = app.issues_progress.start(false).unwrap();
+        let (old_pulls, _) = app.pulls_progress.start(false).unwrap();
+        app.go_back();
+        app.open_selected_repo();
+        let (current_issues, _) = app.issues_progress.start(false).unwrap();
+        let (current_pulls, _) = app.pulls_progress.start(false).unwrap();
+
+        app.on_message(Message::Issues {
+            request: old_issues,
+            repo: "me/project".to_string(),
+            result: Err("old issue failure".to_string()),
+        });
+        app.on_message(Message::Pulls {
+            request: old_pulls,
+            repo: "me/project".to_string(),
+            result: Ok(page(vec![], None)),
+        });
+
+        assert!(matches!(app.issues, Load::Idle));
+        assert!(matches!(app.pulls, Load::Idle));
+        assert!(app.issues_progress.loading());
+        assert!(app.pulls_progress.loading());
+        app.on_message(Message::Issues {
+            request: current_issues,
+            repo: "me/project".to_string(),
+            result: Ok(page(vec![], None)),
+        });
+        app.on_message(Message::Pulls {
+            request: current_pulls,
+            repo: "me/project".to_string(),
+            result: Ok(page(vec![], None)),
+        });
+        assert!(matches!(app.issues, Load::Loaded(_)));
+        assert!(matches!(app.pulls, Load::Loaded(_)));
+        assert!(!app.issues_progress.loading());
+        assert!(!app.pulls_progress.loading());
+    }
+
+    #[test]
+    fn failed_continuation_preserves_rows_and_retries_the_same_cursor_once() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("me/first"), repo("me/second")]);
+        app.repos_progress.next = Some("page-two".to_string());
+        app.refilter();
+        app.repos_state.select(Some(1));
+        let (failed, cursor) = app.repos_progress.start(true).unwrap();
+        assert_eq!(cursor.as_deref(), Some("page-two"));
+
+        app.on_message(Message::Repos {
+            request: failed,
+            result: Err("page failed".to_string()),
+        });
+
+        assert_eq!(app.repos.len(), 2);
+        assert_eq!(app.repos_state.selected(), Some(1));
+        assert_eq!(app.repos_progress.next.as_deref(), Some("page-two"));
+        assert_eq!(app.repos_progress.error.as_deref(), Some("page failed"));
+        let (retried, cursor) = app.repos_progress.start(true).unwrap();
+        assert_eq!(cursor.as_deref(), Some("page-two"));
+        assert!(app.repos_progress.error.is_none());
+        app.on_message(Message::Repos {
+            request: retried,
+            result: Ok(page(vec![repo("me/second"), repo("me/third")], None)),
+        });
+        assert_eq!(app.repos.len(), 3);
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/second");
+        assert!(app.repos_progress.next.is_none());
+        assert!(app.repos_progress.start(true).is_none());
+    }
+
+    #[test]
+    fn fetching_a_continuation_keeps_the_first_page_visible() {
+        let (mut app, rx, server, root) =
+            fixture_app(vec![r#"[{"name":"third","full_name":"me/third"}]"#]);
+        app.repos = Load::Loaded(vec![repo("me/first"), repo("me/second")]);
+        app.repos_progress.next = Some(format!("{root}/user/repos?page=2"));
+        app.refilter();
+        app.repos_state.select(Some(1));
+
+        app.load_more();
+
+        assert!(app.repos_progress.loading());
+        assert_eq!(app.repos.len(), 2);
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/second");
+        receive_message(&mut app, &rx);
+        assert_eq!(app.repos.len(), 3);
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/second");
+        assert!(!app.repos_progress.loading());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_refresh_keeps_loaded_rows_and_a_visible_error() {
+        let (mut app, rx, server, _) = fixture_app(vec!["invalid JSON"]);
+        app.repos = Load::Loaded(vec![repo("me/first"), repo("me/second")]);
+        app.repos_progress.next = Some("page-two".to_string());
+        app.refilter();
+        app.repos_state.select(Some(1));
+
+        app.refresh();
+        assert_eq!(app.repos.len(), 2);
+        receive_message(&mut app, &rx);
+
+        assert_eq!(app.repos.len(), 2);
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/second");
+        assert_eq!(app.repos_progress.next.as_deref(), Some("page-two"));
+        assert!(
+            app.repos_progress
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Could not parse")
+        );
+        assert!(!app.repos_progress.loading());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn page_warnings_persist_until_a_successful_refresh_replaces_them() {
+        let mut progress = ListProgress::default();
+        let mut loaded = Load::Idle;
+        let (first, _) = progress.start(false).unwrap();
+        let mut partial = page(vec![1u8], Some("page-two"));
+        partial.warning = Some("incomplete search".to_string());
+        assert!(progress.finish(first, Ok(partial), &mut loaded, |item| *item));
+        let (second, _) = progress.start(true).unwrap();
+        assert!(progress.finish(second, Ok(page(vec![2], None)), &mut loaded, |item| *item));
+        assert_eq!(progress.warning.as_deref(), Some("incomplete search"));
+
+        let (failed, _) = progress.start(false).unwrap();
+        progress.finish(failed, Err("offline".to_string()), &mut loaded, |item| {
+            *item
+        });
+        assert_eq!(progress.warning.as_deref(), Some("incomplete search"));
+        let (refreshed, _) = progress.start(false).unwrap();
+        progress.finish(refreshed, Ok(page(vec![3], None)), &mut loaded, |item| {
+            *item
+        });
+        assert!(progress.warning.is_none());
+        assert!(progress.error.is_none());
+        assert!(matches!(loaded, Load::Loaded(items) if items == [3]));
+    }
+
+    #[test]
+    fn pagination_cycles_stop_after_each_cursor_is_consumed_once() {
+        let mut progress = ListProgress::default();
+        let mut loaded = Load::Idle;
+        for (more, item, next) in [
+            (false, 1u8, "page-two"),
+            (true, 2, "page-three"),
+            (true, 3, "page-two"),
+        ] {
+            let (request, _) = progress.start(more).unwrap();
+            assert!(progress.finish(
+                request,
+                Ok(page(vec![item], Some(next))),
+                &mut loaded,
+                |item| *item
+            ));
+        }
+        assert!(matches!(loaded, Load::Loaded(items) if items == [1, 2, 3]));
+        assert!(progress.next.is_none());
+        assert!(progress.error.as_deref().unwrap().contains("repeated"));
+        assert!(progress.start(true).is_none());
+    }
+
+    #[test]
+    fn my_pulls_reentry_preserves_loaded_selection_and_continuation() {
+        let mut app = test_app();
+        app.my_pulls = Load::Loaded(serde_json::from_str(
+            r#"[{"number":1,"title":"first","state":"open","repository_url":"https://api.github.com/repos/me/first"},
+                {"number":2,"title":"second","state":"open","repository_url":"https://api.github.com/repos/me/second"}]"#,
+        ).unwrap());
+        app.screen = Screen::MyPulls;
+        app.my_pulls_progress.next = Some("page-two".to_string());
+        app.refilter();
+        app.my_pulls_state.select(Some(1));
+        let selected = app.selected_url();
+
+        app.open_my_pulls();
+        app.go_back();
+        app.open_my_pulls();
+
+        assert_eq!(app.screen, Screen::MyPulls);
+        assert_eq!(app.my_pulls.len(), 2);
+        assert_eq!(app.my_pulls_state.selected(), Some(1));
+        assert_eq!(app.selected_url(), selected);
+        assert_eq!(app.my_pulls_progress.next.as_deref(), Some("page-two"));
+        assert!(!app.my_pulls_progress.loading());
+    }
+
+    #[test]
+    fn ticks_redraw_only_when_the_visible_screen_is_loading() {
+        let mut app = test_app();
+        let initial_spinner = app.spinner;
+        assert!(!app.on_event(Event::Tick).unwrap());
+        app.repos = Load::Loaded(vec![repo("me/project")]);
+        app.refilter();
+        assert!(!app.on_event(Event::Tick).unwrap());
+        app.issues_progress.start(false).unwrap();
+        assert!(!app.on_event(Event::Tick).unwrap());
+        assert_eq!(app.spinner, initial_spinner);
+
+        app.repos_progress.start(false).unwrap();
+        assert!(app.on_event(Event::Tick).unwrap());
+        assert_eq!(app.spinner, initial_spinner.wrapping_add(1));
+        app.screen = Screen::MyPulls;
+        assert!(!app.on_event(Event::Tick).unwrap());
+        app.user = Load::Loading;
+        app.user_request.start().unwrap();
+        assert!(app.on_event(Event::Tick).unwrap());
+        assert_eq!(app.spinner, initial_spinner.wrapping_add(2));
+    }
+
+    #[test]
+    fn terminal_input_failure_exits_event_processing_with_an_error() {
+        let mut app = test_app();
+        let result = app.on_event(Event::InputFailed(std::io::Error::other(
+            "fixture input failure",
+        )));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("fixture input failure")
         );
     }
 }
