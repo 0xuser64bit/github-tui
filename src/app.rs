@@ -18,7 +18,7 @@ use ratatui::widgets::ListState;
 
 use crate::event::{Event, Events, Message};
 use crate::github::{Github, Page};
-use crate::models::{Issue, PullRequest, Repo, SearchedPullRequest, User};
+use crate::models::{Issue, ItemDetail, PullRequest, Repo, SearchedPullRequest, User};
 use crate::ui;
 
 /// The async loading state of a piece of remote data.
@@ -98,6 +98,14 @@ pub(crate) struct ListProgress {
 }
 
 impl ListProgress {
+    fn reset(&mut self) {
+        self.request.invalidate();
+        *self = Self {
+            request: std::mem::take(&mut self.request),
+            ..Self::default()
+        };
+    }
+
     pub(crate) fn loading(&self) -> bool {
         self.request.in_flight
     }
@@ -218,6 +226,15 @@ pub struct App {
     pub(crate) pulls_state: ListState,
     pub(crate) my_pulls: Load<Vec<SearchedPullRequest>>,
     pub(crate) my_pulls_state: ListState,
+    pub(crate) review_mode: bool,
+    pub(crate) preview_open: bool,
+    pub(crate) preview: Load<ItemDetail>,
+    pub(crate) preview_scroll: u16,
+    pub(crate) preview_repo: String,
+    pub(crate) preview_state: String,
+    preview_number: u64,
+    preview_url: String,
+    preview_request: Request,
 
     pub(crate) show_help: bool,
     pub(crate) status: Option<String>,
@@ -263,6 +280,15 @@ impl App {
             pulls_state: ListState::default(),
             my_pulls: Load::Idle,
             my_pulls_state: ListState::default(),
+            review_mode: false,
+            preview_open: false,
+            preview: Load::Idle,
+            preview_scroll: 0,
+            preview_repo: String::new(),
+            preview_state: String::new(),
+            preview_number: 0,
+            preview_url: String::new(),
+            preview_request: Request::default(),
             show_help: false,
             status: None,
             spinner: 0,
@@ -301,9 +327,13 @@ impl App {
             Event::Message(message) => self.on_message(message),
             Event::InputFailed(error) => return Err(error.into()),
             Event::Tick => {
-                if !self.progress().loading()
-                    && !(self.screen == Screen::MyPulls && self.user_request.in_flight)
-                {
+                let loading = if self.preview_open {
+                    self.preview_request.in_flight
+                } else {
+                    self.progress().loading()
+                        || (self.screen == Screen::MyPulls && self.user_request.in_flight)
+                };
+                if !loading {
                     return Ok(false);
                 }
                 self.spinner = self.spinner.wrapping_add(1);
@@ -356,6 +386,30 @@ impl App {
             return;
         }
 
+        if self.preview_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('p') => {
+                    self.preview_open = false;
+                    self.preview_request.invalidate();
+                }
+                KeyCode::Char('q') => self.running = false,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.preview_scroll = self.preview_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(1)
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.preview_scroll = 0,
+                KeyCode::Char('o') | KeyCode::Enter => {
+                    let url = self.preview_url.clone();
+                    self.launch_url(&url);
+                }
+                KeyCode::Char('r') => self.open_preview(),
+                _ => {}
+            }
+            return;
+        }
+
         // While the search bar is active, most keys edit the query.
         if self.search_active {
             match key.code {
@@ -388,9 +442,11 @@ impl App {
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('n') => self.load_more(),
             KeyCode::Char('s') => self.cycle_state_filter(),
+            KeyCode::Char('p') => self.open_preview(),
             KeyCode::Char('o') => self.open_selected_in_browser(),
             KeyCode::Char('/') => self.enter_search(),
             KeyCode::Char('m') => self.open_my_pulls(),
+            KeyCode::Char('v') => self.open_pull_queue(true),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Home | KeyCode::Char('g') => self.move_to_edge(true),
@@ -416,6 +472,12 @@ impl App {
                     } else {
                         self.fetch_my_pulls(false);
                     }
+                }
+                false
+            }
+            Message::Preview { request, result } => {
+                if self.preview_request.finish(request) {
+                    self.preview = result.into();
                 }
                 false
             }
@@ -472,16 +534,8 @@ impl App {
         self.active_repo = Some(repo.clone());
         self.screen = Screen::RepoDetail;
         self.tab = Tab::Issues;
-        self.issues_progress.request.invalidate();
-        self.pulls_progress.request.invalidate();
-        self.issues_progress = ListProgress {
-            request: std::mem::take(&mut self.issues_progress.request),
-            ..ListProgress::default()
-        };
-        self.pulls_progress = ListProgress {
-            request: std::mem::take(&mut self.pulls_progress.request),
-            ..ListProgress::default()
-        };
+        self.issues_progress.reset();
+        self.pulls_progress.reset();
         self.issues = Load::Idle;
         self.pulls = Load::Idle;
         self.issues_state.select(None);
@@ -536,13 +590,27 @@ impl App {
         let Some(url) = self.selected_url() else {
             return;
         };
-        match open_url(&url) {
+        self.launch_url(&url);
+    }
+
+    fn launch_url(&mut self, url: &str) {
+        match open_url(url) {
             Ok(()) => self.status = Some(format!("Opening {url}")),
             Err(_) => self.status = Some("Could not launch a browser.".to_string()),
         }
     }
 
     fn open_my_pulls(&mut self) {
+        self.open_pull_queue(false);
+    }
+
+    fn open_pull_queue(&mut self, review: bool) {
+        if self.review_mode != review {
+            self.review_mode = review;
+            self.my_pulls_progress.reset();
+            self.my_pulls = Load::Idle;
+            self.my_pulls_state.select(None);
+        }
         self.screen = Screen::MyPulls;
         self.active_repo = None;
         self.issues_progress.request.invalidate();
@@ -871,8 +939,13 @@ impl App {
             self.my_pulls = Load::Loading;
         }
         let sender = self.sender.clone();
+        let review = self.review_mode;
         thread::spawn(move || {
-            let result = client.my_pulls_page(&login, next.as_deref());
+            let result = if review {
+                client.review_pulls_page(&login, next.as_deref())
+            } else {
+                client.my_pulls_page(&login, next.as_deref())
+            };
             let _ = sender.send(Event::Message(Message::MyPulls { request, result }));
         });
     }
@@ -916,6 +989,86 @@ impl App {
             StateFilter::Closed | StateFilter::Merged => StateFilter::All,
         };
         self.refilter();
+    }
+
+    fn open_preview(&mut self) {
+        if self.preview_request.in_flight {
+            return;
+        }
+        let target = if self.preview_open {
+            Some((
+                self.preview_repo.clone(),
+                self.preview_number,
+                self.preview_state.clone(),
+            ))
+        } else {
+            self.selected_item()
+        };
+        let Some((repo, number, state)) = target else {
+            return;
+        };
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some((owner, name)) = repo.split_once('/') else {
+            return;
+        };
+        let (owner, name) = (owner.to_string(), name.to_string());
+        if !self.preview_open {
+            self.preview_url = self.selected_url().unwrap_or_default();
+        }
+        self.preview_repo = repo;
+        self.preview_number = number;
+        self.preview_state = state;
+        self.preview_scroll = 0;
+        self.preview_open = true;
+        self.preview = Load::Loading;
+        let Some(request) = self.preview_request.start() else {
+            return;
+        };
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let result = client.item_detail(&owner, &name, number);
+            let _ = sender.send(Event::Message(Message::Preview { request, result }));
+        });
+    }
+
+    fn selected_item(&self) -> Option<(String, u64, String)> {
+        match self.screen {
+            Screen::Repos => None,
+            Screen::RepoDetail => {
+                let repo = self.active_repo.as_ref()?.full_name.clone();
+                match self.tab {
+                    Tab::Issues => {
+                        let Load::Loaded(items) = &self.issues else {
+                            return None;
+                        };
+                        let item =
+                            items.get(*self.filtered_issues.get(self.issues_state.selected()?)?)?;
+                        Some((repo, item.number, item.state.clone()))
+                    }
+                    Tab::Pulls => {
+                        let Load::Loaded(items) = &self.pulls else {
+                            return None;
+                        };
+                        let item =
+                            items.get(*self.filtered_pulls.get(self.pulls_state.selected()?)?)?;
+                        Some((repo, item.number, item.effective_state().to_string()))
+                    }
+                }
+            }
+            Screen::MyPulls => {
+                let Load::Loaded(items) = &self.my_pulls else {
+                    return None;
+                };
+                let item = items.get(
+                    *self
+                        .filtered_my_pulls
+                        .get(self.my_pulls_state.selected()?)?,
+                )?;
+                Some((item.repo(), item.number, item.effective_state().to_string()))
+            }
+        }
     }
 }
 
@@ -1809,5 +1962,122 @@ mod tests {
             app.refilter();
             assert_eq!(app.filtered_my_pulls, vec![0]);
         }
+    }
+    fn issue_preview_app(
+        bodies: Vec<&'static str>,
+    ) -> (App, mpsc::Receiver<Event>, thread::JoinHandle<()>) {
+        let (mut app, rx, server, _) = fixture_app(bodies);
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(repo("owner/project"));
+        app.issues = Load::Loaded(
+            serde_json::from_str(r#"[{"number":42,"title":"work","state":"open"}]"#).unwrap(),
+        );
+        app.refilter();
+        (app, rx, server)
+    }
+
+    #[test]
+    fn preview_fetches_on_demand_and_coalesces_duplicate_fetches() {
+        let (mut app, rx, server) = issue_preview_app(vec![
+            r#"{"number":42,"title":"work","state":"open","body":"Details"}"#,
+        ]);
+        assert!(!app.preview_open);
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let request = app.preview_request.generation;
+        assert!(app.preview_open);
+        assert!(app.on_event(Event::Tick).unwrap());
+        app.open_preview();
+        assert_eq!(app.preview_request.generation, request);
+        receive_message(&mut app, &rx);
+        assert!(
+            matches!(&app.preview, Load::Loaded(detail) if detail.body.as_deref()==Some("Details"))
+        );
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.preview_scroll, 1);
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.preview_scroll, 0);
+        assert!(!app.on_event(Event::Tick).unwrap());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.preview_open);
+        assert_eq!(app.screen, Screen::RepoDetail);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn closing_preview_rejects_its_pending_response() {
+        let (mut app, rx, server) =
+            issue_preview_app(vec![r#"{"number":42,"title":"work","state":"open"}"#]);
+        app.open_preview();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        receive_message(&mut app, &rx);
+        assert!(!app.preview_open);
+        assert!(!app.preview_request.in_flight);
+        assert!(matches!(app.preview, Load::Loading));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn preview_retry_keeps_the_captured_item_when_the_list_changes() {
+        let (mut app, rx, server) = issue_preview_app(vec![
+            r#"{"number":42,"title":"work","state":"open"}"#,
+            r#"{"number":42,"title":"work","state":"open","body":"Retried"}"#,
+        ]);
+        app.open_preview();
+        receive_message(&mut app, &rx);
+        app.issues = Load::Loaded(
+            serde_json::from_str(r#"[{"number":99,"title":"other","state":"closed"}]"#).unwrap(),
+        );
+        app.refilter();
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.preview_number, 42);
+        assert_eq!(
+            app.preview_url,
+            "https://github.com/owner/project/issues/42"
+        );
+        receive_message(&mut app, &rx);
+        assert!(matches!(
+            app.preview,
+            Load::Loaded(ItemDetail { number: 42, .. })
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn switching_personal_queues_discards_old_results_and_continuations() {
+        let mut app = test_app();
+        app.screen = Screen::MyPulls;
+        app.my_pulls = Load::Loaded(vec![]);
+        app.my_pulls_progress.next =
+            Some("https://api.github.com/search/issues?page=2".to_string());
+        let old = app.my_pulls_progress.request.start().unwrap();
+        app.open_pull_queue(true);
+        assert!(app.review_mode);
+        assert!(app.my_pulls_progress.next.is_none());
+        app.on_message(Message::MyPulls {
+            request: old,
+            result: Ok(Page {
+                items: vec![],
+                next: None,
+                warning: None,
+            }),
+        });
+        assert!(matches!(app.my_pulls, Load::Idle));
+        app.open_my_pulls();
+        assert!(!app.review_mode);
+    }
+
+    #[test]
+    fn review_queue_waits_for_identity_and_loads_its_first_page() {
+        let (mut app, rx, server, _) = fixture_app(vec![
+            r#"{"login":"octocat"}"#,
+            r#"{"total_count":1,"incomplete_results":false,"items":[{"number":7,"title":"Review me","state":"open"}]}"#,
+        ]);
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        receive_message(&mut app, &rx);
+        receive_message(&mut app, &rx);
+        assert!(app.review_mode);
+        assert!(matches!(&app.my_pulls, Load::Loaded(items) if items.len()==1));
+        assert_eq!(app.filtered_my_pulls, vec![0]);
+        server.join().unwrap();
     }
 }

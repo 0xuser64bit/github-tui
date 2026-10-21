@@ -1,5 +1,5 @@
 //! All rendering. Pure presentation: reads [`App`] state and draws it, with the
-//! sole exception of mutating `ListState`s, which stateful widgets require.
+//! exceptions of updating widget `ListState`s and clamping preview scrolling.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -91,6 +91,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_footer(frame, app, footer_area);
 
+    if app.preview_open {
+        render_preview(frame, app, area);
+    }
     if app.show_help {
         render_help(frame, area);
     }
@@ -122,7 +125,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 Tab::Pulls => "Pull Requests",
             }));
         }
-        Screen::MyPulls => spans.push(Span::raw("My Pull Requests")),
+        Screen::MyPulls => spans.push(Span::raw(if app.review_mode {
+            "Review Requests"
+        } else {
+            "My Pull Requests"
+        })),
     }
     if app.screen != Screen::Repos {
         let (visible, loaded) = match app.screen {
@@ -276,7 +283,11 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_my_pulls(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::bordered()
         .border_style(Style::new().dim())
-        .title(Line::from(" My Pull Requests "));
+        .title(if app.review_mode {
+            " Review Requests "
+        } else {
+            " My Pull Requests "
+        });
 
     match &app.my_pulls {
         Load::Idle | Load::Loading => {
@@ -355,13 +366,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.screen {
             Screen::Repos => {
-                " ↑↓ move · enter open · m my PRs · / search · o browser · r refresh · ? help · q quit"
+                " enter open · m my PRs · v reviews · / search · n next · r refresh · ? help"
             }
             Screen::RepoDetail => {
-                " ↑↓ move · tab switch · / search · enter/o browser · esc back · r refresh · q quit"
+                " p preview · enter/o browser · s state · n next · tab switch · Esc back · ? help"
             }
             Screen::MyPulls => {
-                " ↑↓ move · / search · enter/o browser · esc back · r refresh · ? help · q quit"
+                " p preview · enter/o browser · s state · n next · Esc back · ? help"
             }
         }
     };
@@ -403,7 +414,7 @@ fn render_auth_required(frame: &mut Frame, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(area, 64, 18);
+    let popup = centered_rect(area, 64, 19);
     frame.render_widget(Clear, popup);
 
     let rows = [
@@ -413,6 +424,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("Esc / h / ←", "Back to repository list"),
         ("Tab", "Switch Issues / Pull Requests"),
         ("m", "View your pull requests"),
+        ("v", "View requested reviews"),
+        ("p", "Preview selected issue / pull request"),
         ("/", "Search / filter the current list"),
         ("s", "Cycle all / open / closed / merged"),
         ("o", "Open current selection in browser"),
@@ -435,6 +448,52 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .border_style(Style::new().fg(ACCENT))
         .title(" Keybindings (any key to close) ");
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
+}
+
+fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
+    let popup = centered_rect(area, 90, 30);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(ACCENT))
+        .title(" Preview · j/k scroll · o browser · r retry · Esc close ")
+        .title_bottom(" Esc close ");
+    let inner = block.inner(popup);
+
+    let text = match &app.preview {
+        Load::Idle | Load::Loading => loading(app, "preview"),
+        Load::Failed(message) => failure(message),
+        Load::Loaded(item) => {
+            let state = if item.state == "closed" && app.preview_state == "merged" {
+                "merged"
+            } else {
+                item.state.as_str()
+            };
+            let author = item.user.as_ref().map_or("unknown", |user| &user.login);
+            let body = item
+                .body
+                .as_deref()
+                .filter(|body| !body.trim().is_empty())
+                .unwrap_or("No description provided.");
+            let mut lines = vec![
+                Line::styled(
+                    format!("{} #{}: {}", app.preview_repo, item.number, item.title),
+                    Style::new().bold().fg(ACCENT),
+                ),
+                Line::from(vec![state_dot(state), Span::raw(format!("by {author}"))]),
+                Line::default(),
+            ];
+            lines.extend(body.lines().map(Line::from));
+            Text::from(lines)
+        }
+    };
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+    // line_count includes border height, but wrapping needs the inner width.
+    let max_scroll = paragraph
+        .line_count(inner.width)
+        .saturating_sub(popup.height as usize)
+        .min(u16::MAX as usize) as u16;
+    app.preview_scroll = app.preview_scroll.min(max_scroll);
+    frame.render_widget(paragraph.scroll((app.preview_scroll, 0)), popup);
 }
 
 // --- item builders ---------------------------------------------------------
@@ -591,7 +650,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::github::Github;
-    use crate::models::{Issue, PullRequest, User};
+    use crate::models::{Issue, ItemDetail, PullRequest, User};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::sync::mpsc;
@@ -627,6 +686,23 @@ mod tests {
             private: false,
             archived: false,
         }
+    }
+
+    fn preview_app(body: Option<&str>) -> App {
+        let mut app = authed_app();
+        app.preview_open = true;
+        app.preview_repo = "octocat/project".to_string();
+        app.preview_state = "merged".to_string();
+        app.preview = Load::Loaded(ItemDetail {
+            number: 7,
+            title: "Preview title".to_string(),
+            state: "closed".to_string(),
+            body: body.map(str::to_string),
+            user: Some(User {
+                login: "octocat".to_string(),
+            }),
+        });
+        app
     }
 
     #[test]
@@ -847,5 +923,112 @@ mod tests {
         assert!(text.contains("No pull requests on this page"));
         assert!(text.contains("incomplete"));
         assert!(text.contains("n: load next page"));
+    }
+
+    #[test]
+    fn review_requests_use_their_own_heading_and_search() {
+        let mut app = authed_app();
+        app.screen = Screen::MyPulls;
+        app.review_mode = true;
+        app.my_pulls = Load::Loaded(
+            serde_json::from_str(
+                r#"[{"number":7,"title":"review this","state":"open",
+                     "repository_url":"https://api.github.com/repos/octocat/project"}]"#,
+            )
+            .unwrap(),
+        );
+        app.search_active = true;
+        app.search_query = "review".to_string();
+        app.refilter();
+
+        let text = rendered(&mut app, 80, 24);
+        assert_eq!(text.matches("Review Requests").count(), 2);
+        assert!(!text.contains("My Pull Requests"));
+        assert!(text.contains("/ review█"));
+        assert!(text.contains("review this"));
+        assert!(text.contains("octocat/project"));
+    }
+
+    #[test]
+    fn preview_renders_plain_multiline_body_and_effective_state() {
+        let mut app = preview_app(Some(
+            "First paragraph\n\n# Plain heading\nliteral **stars**",
+        ));
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("Preview · j/k scroll"));
+        assert!(text.contains("octocat/project #7: Preview title"));
+        assert!(text.contains("● merged"));
+        assert!(text.contains("by octocat"));
+        assert!(text.contains("First paragraph"));
+        assert!(text.contains("# Plain heading"));
+        assert!(text.contains("literal **stars**"));
+
+        app.preview_open = false;
+        assert!(!rendered(&mut app, 80, 24).contains("Preview title"));
+    }
+
+    #[test]
+    fn preview_shows_empty_loading_and_failure_states() {
+        for body in [None, Some(""), Some(" \n\t")] {
+            let mut app = preview_app(body);
+            assert!(rendered(&mut app, 80, 24).contains("No description provided"));
+        }
+
+        let mut app = preview_app(None);
+        app.preview = Load::Idle;
+        assert!(rendered(&mut app, 80, 24).contains("Loading preview"));
+        app.preview = Load::Loading;
+        assert!(rendered(&mut app, 80, 24).contains("Loading preview"));
+        app.preview = Load::Failed("Could not load the description.".to_string());
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("Could not load the description"));
+        assert!(text.contains("Press r to retry"));
+    }
+
+    #[test]
+    fn preview_scrolls_long_content_and_fits_small_terminals() {
+        let mut app = preview_app(Some("first body line\nsecond body line\nlast body line"));
+        app.preview_scroll = 3;
+        let text = rendered(&mut app, 40, 6);
+        assert!(text.contains("first body line"));
+        assert!(text.contains("last body line"));
+        assert!(!text.contains("Preview title"));
+
+        let long = format!(
+            "{}\nLast visible line",
+            "a very long description ".repeat(200)
+        );
+        app.preview = Load::Loaded(ItemDetail {
+            number: 7,
+            title: "A long title that wraps over multiple lines".to_string(),
+            state: "open".to_string(),
+            body: Some(long),
+            user: None,
+        });
+        for (width, height) in [(80, 10), (24, 8)] {
+            app.preview_scroll = u16::MAX;
+            let text = rendered(&mut app, width, height);
+            assert!(app.preview_scroll < u16::MAX);
+            assert!(text.contains("Last visible line"));
+            assert!(!text.contains("Preview title"));
+        }
+        assert!(!rendered(&mut app, 1, 1).is_empty());
+        assert!(rendered(&mut app, 24, 8).contains("Esc close"));
+    }
+    #[test]
+    fn preview_uses_the_freshly_fetched_state() {
+        let mut app = preview_app(Some("Details"));
+        app.preview_state = "open".to_string();
+        if let Load::Loaded(item) = &mut app.preview {
+            item.state = "closed".to_string();
+        }
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("● closed"));
+        assert!(!text.contains("● open"));
+        app.preview_state = "merged".to_string();
+        if let Load::Loaded(item) = &mut app.preview {
+            item.state = "open".to_string();
+        }
+        assert!(rendered(&mut app, 80, 24).contains("● open"));
     }
 }
