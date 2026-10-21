@@ -885,12 +885,41 @@ fn move_selection(state: &mut ListState, len: usize, delta: isize) {
 
 /// Open `url` in the platform's default browser, detached and silent.
 fn open_url(url: &str) -> std::io::Result<()> {
-    browser_command(url)
+    validate_browser_url(url)?;
+    launch_browser(browser_command(url)).map(|_| ())
+}
+
+fn validate_browser_url(url: &str) -> std::io::Result<()> {
+    let valid = url.parse::<ureq::http::Uri>().is_ok_and(|uri| {
+        uri.scheme_str() == Some("https")
+            && uri
+                .authority()
+                .is_some_and(|authority| authority.as_str() == "github.com")
+            && uri.query().is_none()
+            && uri
+                .path()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Expected a GitHub HTTPS resource URL",
+        ))
+    }
+}
+
+fn launch_browser(
+    mut command: Command,
+) -> std::io::Result<thread::JoinHandle<std::io::Result<std::process::ExitStatus>>> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+        .spawn()?;
+    Ok(thread::spawn(move || child.wait()))
 }
 
 #[cfg(target_os = "macos")]
@@ -1611,5 +1640,42 @@ mod tests {
                 .to_string()
                 .contains("fixture input failure")
         );
+    }
+    #[test]
+    fn browser_launch_accepts_only_canonical_github_resource_urls() {
+        for url in [
+            "https://github.com/owner/repo",
+            "https://github.com/owner/repo/issues/12",
+            "https://github.com/owner/repo/pull/7",
+        ] {
+            assert!(validate_browser_url(url).is_ok());
+        }
+        for url in [
+            "http://github.com/owner/repo",
+            "https://example.com/",
+            "https://github.com.evil.example/",
+            "https://github.com@evil.example/",
+            "https://github.com:443/repo",
+            "https://github.com/a/b?x=1&y=2",
+            "https://github.com/a/b%20x",
+            "https://github.com/a/b|other",
+            "file:///tmp/anything",
+        ] {
+            assert!(open_url(url).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn browser_launcher_is_reaped_in_a_worker() {
+        #[cfg(unix)]
+        let mut command = Command::new("sh");
+        #[cfg(windows)]
+        let mut command = Command::new("cmd");
+        #[cfg(unix)]
+        command.args(["-c", "exit 0"]);
+        #[cfg(windows)]
+        command.args(["/C", "exit", "0"]);
+        let worker = launch_browser(command).unwrap();
+        assert!(worker.join().unwrap().unwrap().success());
     }
 }
