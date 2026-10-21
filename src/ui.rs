@@ -124,6 +124,19 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         }
         Screen::MyPulls => spans.push(Span::raw("My Pull Requests")),
     }
+    if app.screen != Screen::Repos {
+        let (visible, loaded) = match app.screen {
+            Screen::RepoDetail if app.tab == Tab::Issues => {
+                (app.filtered_issues.len(), app.issues.len())
+            }
+            Screen::RepoDetail => (app.filtered_pulls.len(), app.pulls.len()),
+            _ => (app.filtered_my_pulls.len(), app.my_pulls.len()),
+        };
+        spans.push(Span::raw(format!(
+            " · {} · {visible}/{loaded} loaded",
+            app.state_filter.label()
+        )));
+    }
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::new().bg(Color::Reset)),
@@ -401,6 +414,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("Tab", "Switch Issues / Pull Requests"),
         ("m", "View your pull requests"),
         ("/", "Search / filter the current list"),
+        ("s", "Cycle all / open / closed / merged"),
         ("o", "Open current selection in browser"),
         ("r", "Refresh the current view"),
         ("n", "Load the next page (keeps loaded rows)"),

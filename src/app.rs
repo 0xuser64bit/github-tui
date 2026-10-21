@@ -171,6 +171,30 @@ pub enum Tab {
     Pulls,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum StateFilter {
+    #[default]
+    All,
+    Open,
+    Closed,
+    Merged,
+}
+
+impl StateFilter {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+        }
+    }
+
+    fn matches(self, state: &str) -> bool {
+        self == Self::All || self.label() == state
+    }
+}
+
 /// Braille spinner frames used while data loads.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -208,6 +232,7 @@ pub struct App {
     pub(crate) search_active: bool,
     /// Current search query text.
     pub(crate) search_query: String,
+    pub(crate) state_filter: StateFilter,
     /// Indices into the loaded repos that match the current query.
     pub(crate) filtered_repos: Vec<usize>,
     /// Indices into the loaded issues that match the current query.
@@ -248,6 +273,7 @@ impl App {
             my_pulls_progress: ListProgress::default(),
             search_active: false,
             search_query: String::new(),
+            state_filter: StateFilter::All,
             filtered_repos: Vec::new(),
             filtered_issues: Vec::new(),
             filtered_pulls: Vec::new(),
@@ -361,6 +387,7 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('n') => self.load_more(),
+            KeyCode::Char('s') => self.cycle_state_filter(),
             KeyCode::Char('o') => self.open_selected_in_browser(),
             KeyCode::Char('/') => self.enter_search(),
             KeyCode::Char('m') => self.open_my_pulls(),
@@ -487,6 +514,7 @@ impl App {
                 Tab::Issues => Tab::Pulls,
                 Tab::Pulls => Tab::Issues,
             };
+            self.state_filter = StateFilter::All;
             self.refilter();
         }
     }
@@ -642,6 +670,7 @@ impl App {
     fn clear_search(&mut self) {
         self.search_active = false;
         self.search_query.clear();
+        self.state_filter = StateFilter::All;
         self.filtered_repos.clear();
         self.filtered_issues.clear();
         self.filtered_pulls.clear();
@@ -681,7 +710,8 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, issue)| {
-                    query.is_empty() || issue.title.to_lowercase().contains(&query)
+                    self.state_filter.matches(&issue.state)
+                        && matches_item(&query, &issue.title, issue.author(), issue.number)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -694,7 +724,10 @@ impl App {
             self.filtered_pulls = pulls
                 .iter()
                 .enumerate()
-                .filter(|(_, pr)| query.is_empty() || pr.title.to_lowercase().contains(&query))
+                .filter(|(_, pr)| {
+                    self.state_filter.matches(pr.effective_state())
+                        && matches_item(&query, &pr.title, pr.author(), pr.number)
+                })
                 .map(|(i, _)| i)
                 .collect();
         } else {
@@ -707,10 +740,9 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, pr)| {
-                    query.is_empty()
-                        || pr.title.to_lowercase().contains(&query)
-                        || pr.repo().to_lowercase().contains(&query)
-                        || pr.author().to_lowercase().contains(&query)
+                    self.state_filter.matches(pr.effective_state())
+                        && (matches_item(&query, &pr.title, pr.author(), pr.number)
+                            || pr.repo().to_lowercase().contains(&query))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -870,6 +902,29 @@ impl App {
             Screen::MyPulls => &self.my_pulls_progress,
         }
     }
+
+    fn cycle_state_filter(&mut self) {
+        if self.screen == Screen::Repos {
+            return;
+        }
+        self.state_filter = match self.state_filter {
+            StateFilter::All => StateFilter::Open,
+            StateFilter::Open => StateFilter::Closed,
+            StateFilter::Closed if self.screen != Screen::RepoDetail || self.tab == Tab::Pulls => {
+                StateFilter::Merged
+            }
+            StateFilter::Closed | StateFilter::Merged => StateFilter::All,
+        };
+        self.refilter();
+    }
+}
+
+fn matches_item(query: &str, title: &str, author: &str, number: u64) -> bool {
+    let number_query = query.strip_prefix('#').unwrap_or(query);
+    query.is_empty()
+        || title.to_lowercase().contains(query)
+        || author.to_lowercase().contains(query)
+        || (!number_query.is_empty() && number.to_string().contains(number_query))
 }
 
 /// Move a list selection by `delta`, wrapping at both ends.
@@ -1677,5 +1732,82 @@ mod tests {
         command.args(["/C", "exit", "0"]);
         let worker = launch_browser(command).unwrap();
         assert!(worker.join().unwrap().unwrap().success());
+    }
+    #[test]
+    fn state_and_text_filters_compose_without_losing_source_indices() {
+        let mut app = test_app();
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(repo("owner/project"));
+        app.tab = Tab::Pulls;
+        app.pulls = Load::Loaded(
+            serde_json::from_str(
+                r#"[
+            {"number":1,"title":"old","state":"closed"},
+            {"number":42,"title":"work","state":"open","user":{"login":"Octocat"}},
+            {"number":43,"title":"work","state":"closed","merged_at":"2026-01-01"}
+        ]"#,
+            )
+            .unwrap(),
+        );
+        app.refilter();
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.filtered_pulls, vec![1]);
+        app.search_query = "#42".to_string();
+        app.refilter();
+        assert_eq!(
+            app.selected_url().as_deref(),
+            Some("https://github.com/owner/project/pull/42")
+        );
+        app.search_query = "octocat".to_string();
+        app.refilter();
+        assert_eq!(app.filtered_pulls, vec![1]);
+        app.cycle_state_filter();
+        assert!(app.filtered_pulls.is_empty());
+        assert!(app.pulls_state.selected().is_none());
+        app.exit_search();
+        assert_eq!(app.filtered_pulls, vec![0]);
+        app.cycle_state_filter();
+        assert_eq!(app.filtered_pulls, vec![2]);
+        app.cycle_state_filter();
+        assert_eq!(app.filtered_pulls, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn issues_cycle_only_applicable_states_and_search_their_authors() {
+        let mut app = test_app();
+        app.screen = Screen::RepoDetail;
+        app.issues = Load::Loaded(
+            serde_json::from_str(
+                r#"[
+            {"number":7,"title":"first","state":"open","user":{"login":"Alice"}},
+            {"number":8,"title":"second","state":"closed"}
+        ]"#,
+            )
+            .unwrap(),
+        );
+        app.search_query = "alice".to_string();
+        app.refilter();
+        assert_eq!(app.filtered_issues, vec![0]);
+        app.exit_search();
+        for expected in ["open", "closed", "all"] {
+            app.cycle_state_filter();
+            assert_eq!(app.state_filter.label(), expected);
+        }
+        assert!(matches_item("#8", "second", "unknown", 8));
+        assert!(!matches_item("#", "second", "unknown", 8));
+    }
+
+    #[test]
+    fn global_pull_search_matches_number_author_and_repository() {
+        let mut app = test_app();
+        app.screen = Screen::MyPulls;
+        app.my_pulls = Load::Loaded(serde_json::from_str(r#"[
+            {"number":42,"title":"work","state":"open","user":{"login":"Alice"},"repository_url":"https://api.github.com/repos/owner/project"}
+        ]"#).unwrap());
+        for query in ["#42", "42", "ALICE", "owner/project"] {
+            app.search_query = query.to_string();
+            app.refilter();
+            assert_eq!(app.filtered_my_pulls, vec![0]);
+        }
     }
 }
