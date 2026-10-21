@@ -221,8 +221,8 @@ impl App {
                     self.move_cursor(delta);
                 }
                 KeyCode::Enter => {
-                    self.exit_search();
                     self.activate_selection();
+                    self.exit_search();
                 }
                 _ => {}
             }
@@ -865,5 +865,98 @@ mod tests {
         app.refilter();
         // Only 1 result, cursor must have been clamped to 0.
         assert_eq!(app.repos_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn search_enter_opens_the_filtered_repository() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("user/alpha"), repo("user/beta")]);
+        app.enter_search();
+        app.search_query = "beta".to_string();
+        app.refilter();
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.screen, Screen::RepoDetail);
+        assert_eq!(app.active_repo.as_ref().unwrap().full_name, "user/beta");
+        assert!(!app.search_active);
+        assert!(app.search_query.is_empty());
+    }
+
+    #[test]
+    fn search_enter_with_no_matches_does_not_open_a_repository() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("user/alpha")]);
+        app.enter_search();
+        app.search_query = "missing".to_string();
+        app.refilter();
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.screen, Screen::Repos);
+        assert!(app.active_repo.is_none());
+        assert!(!app.search_active);
+    }
+
+    #[test]
+    fn search_escape_clears_without_activating() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("user/alpha"), repo("user/beta")]);
+        app.enter_search();
+        app.search_query = "beta".to_string();
+        app.refilter();
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.screen, Screen::Repos);
+        assert!(app.active_repo.is_none());
+        assert_eq!(app.filtered_repos, vec![0, 1]);
+    }
+
+    #[test]
+    fn filtered_issue_and_pull_urls_use_source_indices() {
+        let mut app = test_app();
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(repo("owner/project"));
+        app.issues = Load::Loaded(
+            serde_json::from_str(
+                r#"[{"number":1,"title":"alpha","state":"open"},
+                {"number":2,"title":"beta","state":"open"}]"#,
+            )
+            .unwrap(),
+        );
+        app.pulls = Load::Loaded(
+            serde_json::from_str(
+                r#"[{"number":3,"title":"alpha","state":"open"},
+                {"number":4,"title":"beta","state":"open"}]"#,
+            )
+            .unwrap(),
+        );
+        app.my_pulls = Load::Loaded(
+            serde_json::from_str(
+                r#"[{"number":5,"title":"alpha","state":"open"},
+                {"number":6,"title":"beta","state":"open",
+                 "html_url":"https://github.com/other/project/pull/6"}]"#,
+            )
+            .unwrap(),
+        );
+        app.search_query = "beta".to_string();
+        app.refilter();
+        assert_eq!(
+            app.selected_url().as_deref(),
+            Some("https://github.com/owner/project/issues/2")
+        );
+        app.tab = Tab::Pulls;
+        app.refilter();
+        assert_eq!(
+            app.selected_url().as_deref(),
+            Some("https://github.com/owner/project/pull/4")
+        );
+        app.screen = Screen::MyPulls;
+        app.refilter();
+        assert_eq!(
+            app.selected_url().as_deref(),
+            Some("https://github.com/other/project/pull/6")
+        );
     }
 }
