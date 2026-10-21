@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use ureq::config::RedirectAuthHeaders;
 use ureq::http::{HeaderMap, Uri};
 
-use crate::models::{Issue, PullRequest, Repo, SearchedPullRequest, User};
+use crate::models::{Issue, ItemDetail, PullRequest, Repo, SearchedPullRequest, User};
 
 const API_ROOT: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
@@ -123,6 +123,12 @@ impl Github {
         self.get_json("/user", None).map(|(user, _)| user)
     }
 
+    /// Issue or pull-request title and body for the read-only preview.
+    pub fn item_detail(&self, owner: &str, repo: &str, number: u64) -> Result<ItemDetail, String> {
+        self.get_json(&format!("/repos/{owner}/{repo}/issues/{number}"), None)
+            .map(|(detail, _)| detail)
+    }
+
     /// Repositories the token can see, most-recently-updated first.
     pub fn list_repos(&self) -> Result<Vec<Repo>, String> {
         collect_pages(|next| self.repos_page(next))
@@ -187,6 +193,27 @@ impl Github {
         login: &str,
         next: Option<&str>,
     ) -> Result<Page<SearchedPullRequest>, String> {
+        // Omitting a state qualifier includes both open and closed PRs.
+        self.search_pulls_page(&format!("type:pr author:{login}"), next)
+    }
+
+    /// Open pull requests that explicitly request this user's review.
+    pub fn review_pulls_page(
+        &self,
+        login: &str,
+        next: Option<&str>,
+    ) -> Result<Page<SearchedPullRequest>, String> {
+        self.search_pulls_page(
+            &format!("type:pr review-requested:{login} state:open"),
+            next,
+        )
+    }
+
+    fn search_pulls_page(
+        &self,
+        query: &str,
+        next: Option<&str>,
+    ) -> Result<Page<SearchedPullRequest>, String> {
         #[derive(Deserialize)]
         struct SearchEnvelope<T> {
             total_count: u64,
@@ -194,8 +221,7 @@ impl Github {
             items: Vec<T>,
         }
 
-        // Omitting a state qualifier includes both open and closed PRs.
-        let query = urlencode(&format!("type:pr author:{login}"));
+        let query = urlencode(query);
         let path = format!("/search/issues?q={query}&per_page={PER_PAGE}&sort=updated&order=desc");
         let (envelope, next): (SearchEnvelope<SearchedPullRequest>, _) =
             self.get_json(&path, next)?;
@@ -817,5 +843,75 @@ mod tests {
         );
         assert!(client.retry_after().is_some());
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn item_detail_parses_optional_body_and_user_without_extra_requests() {
+        for (optional, expected_body) in [
+            ("", None),
+            (r#", "body":null,"user":null"#, None),
+            (
+                r#", "body":"Read-only preview","user":{"login":"octocat"}"#,
+                Some("Read-only preview"),
+            ),
+        ] {
+            let body = format!(r#"{{"number":42,"title":"Detail","state":"closed"{optional}}}"#);
+            let (client, worker) = fixture(vec![reply(200, "", body)]);
+            let detail = client.item_detail("me", "repo", 42).unwrap();
+            assert_eq!(detail.number, 42);
+            assert_eq!(detail.title, "Detail");
+            assert_eq!(detail.state, "closed");
+            assert_eq!(detail.body.as_deref(), expected_body);
+            assert_eq!(
+                detail.user.as_ref().map(|user| user.login.as_str()),
+                expected_body.map(|_| "octocat")
+            );
+            let requests = worker.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET /repos/me/repo/issues/42 "));
+        }
+    }
+
+    #[test]
+    fn item_detail_rejects_invalid_number_response() {
+        let (client, worker) = fixture(vec![reply(
+            200,
+            "",
+            r#"{"number":"42","title":"Detail","state":"open"}"#,
+        )]);
+        assert!(
+            client
+                .item_detail("me", "repo", 42)
+                .unwrap_err()
+                .contains("Could not parse")
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn review_queue_uses_shared_search_warnings_and_continuation() {
+        let (client, worker) = fixture(vec![
+            reply(
+                200,
+                "Link: <$ROOT/search/issues?page=2>; rel=\"next\"\r\n",
+                r#"{"total_count":1001,"incomplete_results":false,"items":[{"number":7,"title":"Review me","state":"open"}]}"#,
+            ),
+            reply(
+                200,
+                "",
+                r#"{"total_count":1001,"incomplete_results":true,"items":[]}"#,
+            ),
+        ]);
+        let first = client.review_pulls_page("octocat", None).unwrap();
+        assert_eq!(first.items[0].number, 7);
+        assert!(first.warning.unwrap().contains("1,000"));
+        let second = client
+            .review_pulls_page("octocat", first.next.as_deref())
+            .unwrap();
+        assert!(second.warning.unwrap().contains("timed out"));
+        assert!(second.next.is_none());
+        let requests = worker.join().unwrap();
+        assert!(requests[0].starts_with("GET /search/issues?q=type%3Apr%20review-requested%3Aoctocat%20state%3Aopen&per_page=100&sort=updated&order=desc "));
+        assert!(requests[1].starts_with("GET /search/issues?page=2 "));
     }
 }

@@ -78,6 +78,18 @@ impl Issue {
     }
 }
 
+/// Issue-shaped detail payload, shared by issue and pull-request previews.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ItemDetail {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
 /// A pull request, as returned by `GET /repos/{owner}/{repo}/pulls`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PullRequest {
