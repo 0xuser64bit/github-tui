@@ -5,7 +5,7 @@ description = "A read-only terminal UI for browsing GitHub repositories, issues,
 authors = ["user-64bit <arth.prajapati@outlook.com>"]
 license = "MIT"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
 ratatui = "0.30.0"
