@@ -304,7 +304,11 @@ fn render_auth_required(frame: &mut Frame, area: Rect) {
         Line::from("  • run `gh auth login` with the GitHub CLI"),
         Line::from(""),
         Line::from(Span::styled(
-            "A read-only (repo) scope is sufficient.",
+            "Prefer a fine-grained token limited to the repositories you need,",
+            Style::new().dim(),
+        )),
+        Line::from(Span::styled(
+            "with read-only Issues and Pull requests permissions.",
             Style::new().dim(),
         )),
     ]);
@@ -354,7 +358,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
 
 fn repo_item(repo: &Repo) -> ListItem<'static> {
     let mut spans = vec![Span::styled(
-        repo.name.clone(),
+        repo.full_name.clone(),
         Style::new().bold().fg(ACCENT),
     )];
     for (flag, label, color) in [
@@ -442,7 +446,7 @@ fn state_dot(state: &str) -> Span<'static> {
         "merged" => Color::Cyan,
         _ => CLOSED,
     };
-    Span::styled("● ", Style::new().fg(color))
+    Span::styled(format!("● {state} "), Style::new().fg(color))
 }
 
 // --- small helpers ---------------------------------------------------------
@@ -509,10 +513,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::sync::mpsc;
 
-    /// Render `app` into an 80x24 test buffer and return its text content.
+    /// Render `app` into a test buffer and return its text content.
     /// Panics in `render` (layout/index bugs) fail the test here.
-    fn rendered(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    fn rendered(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
         terminal
             .backend()
@@ -546,9 +550,11 @@ mod tests {
     fn auth_screen_explains_how_to_authenticate() {
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(None, tx);
-        let text = rendered(&mut app);
+        let text = rendered(&mut app, 80, 24);
         assert!(text.contains("No GitHub token found"));
         assert!(text.contains("GITHUB_TOKEN"));
+        assert!(text.contains("fine-grained token limited to the repositories you need"));
+        assert!(text.contains("read-only Issues and Pull requests permissions"));
     }
 
     #[test]
@@ -556,14 +562,14 @@ mod tests {
         let mut app = authed_app();
         // Loading state shows the spinner copy.
         app.repos = Load::Loading;
-        assert!(rendered(&mut app).contains("Loading repositories"));
+        assert!(rendered(&mut app, 80, 24).contains("Loading repositories"));
 
         // Loaded state shows the repo and its metadata.
         app.repos = Load::Loaded(vec![sample_repo()]);
         app.refilter();
         app.repos_state.select(Some(0));
-        let text = rendered(&mut app);
-        assert!(text.contains("github-tui"));
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("user-64bit/github-tui"));
         assert!(text.contains("Rust"));
     }
 
@@ -571,7 +577,7 @@ mod tests {
     fn failed_repos_show_retry_hint() {
         let mut app = authed_app();
         app.repos = Load::Failed("Network error: offline".to_string());
-        let text = rendered(&mut app);
+        let text = rendered(&mut app, 80, 24);
         assert!(text.contains("Network error"));
         assert!(text.contains("retry"));
     }
@@ -605,13 +611,15 @@ mod tests {
         }]);
         app.refilter();
 
-        let issues_view = rendered(&mut app);
+        let issues_view = rendered(&mut app, 80, 24);
+        assert!(issues_view.contains("● open"));
         assert!(issues_view.contains("#42"));
         assert!(issues_view.contains("fix the crash"));
         assert!(issues_view.contains("octocat"));
 
         app.tab = Tab::Pulls;
-        let pulls_view = rendered(&mut app);
+        let pulls_view = rendered(&mut app, 80, 24);
+        assert!(pulls_view.contains("● open"));
         assert!(pulls_view.contains("#7"));
         assert!(pulls_view.contains("add tests"));
         assert!(pulls_view.contains("[draft]"));
@@ -621,6 +629,109 @@ mod tests {
     fn help_overlay_renders() {
         let mut app = authed_app();
         app.show_help = true;
-        assert!(rendered(&mut app).contains("Keybindings"));
+        assert!(rendered(&mut app, 80, 24).contains("Keybindings"));
+    }
+
+    #[test]
+    fn repository_owners_disambiguate_matching_names() {
+        let mut app = authed_app();
+        let mut first = sample_repo();
+        first.full_name = "alice/github-tui".to_string();
+        let mut second = first.clone();
+        second.full_name = "bob/github-tui".to_string();
+        app.repos = Load::Loaded(vec![first, second]);
+        app.refilter();
+
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("alice/github-tui"));
+        assert!(text.contains("bob/github-tui"));
+    }
+
+    #[test]
+    fn search_bar_and_filtered_results_render() {
+        let mut app = authed_app();
+        let mut kept = sample_repo();
+        kept.name = "kept".to_string();
+        kept.full_name = "alice/kept".to_string();
+        let mut hidden = sample_repo();
+        hidden.full_name = "bob/hidden".to_string();
+        app.repos = Load::Loaded(vec![kept, hidden]);
+        app.search_active = true;
+        app.search_query = "kept".to_string();
+        app.refilter();
+
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("/ kept█"));
+        assert!(text.contains("alice/kept"));
+        assert!(!text.contains("bob/hidden"));
+
+        app.search_query = "missing".to_string();
+        app.refilter();
+        assert!(rendered(&mut app, 80, 24).contains("No matching repositories"));
+    }
+
+    #[test]
+    fn my_pulls_render_text_states_and_load_states() {
+        let mut app = authed_app();
+        app.screen = Screen::MyPulls;
+        app.my_pulls = Load::Loaded(
+            serde_json::from_str(
+                r#"[
+                    {"number":7,"title":"first","state":"open","draft":true,
+                     "repository_url":"https://api.github.com/repos/octocat/project",
+                     "user":{"login":"octocat"}},
+                    {"number":8,"title":"second","state":"closed"},
+                    {"number":9,"title":"third","state":"closed",
+                     "pull_request":{"merged_at":"2024-01-01T00:00:00Z"}}
+                ]"#,
+            )
+            .unwrap(),
+        );
+        app.refilter();
+
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("My Pull Requests"));
+        assert!(text.contains("octocat/project"));
+        assert!(text.contains("[draft]"));
+        assert!(text.contains("● open"));
+        assert!(text.contains("● closed"));
+        assert!(text.contains("● merged"));
+
+        app.search_active = true;
+        app.search_query = "missing".to_string();
+        app.refilter();
+        assert!(rendered(&mut app, 80, 24).contains("No matching pull requests"));
+
+        app.my_pulls = Load::Loaded(vec![]);
+        assert!(rendered(&mut app, 80, 24).contains("No pull requests found"));
+        app.my_pulls = Load::Failed("Network error: offline".to_string());
+        let failed = rendered(&mut app, 80, 24);
+        assert!(failed.contains("Network error: offline"));
+        assert!(failed.contains("Press r to retry"));
+        app.my_pulls = Load::Loading;
+        assert!(rendered(&mut app, 80, 24).contains("Loading pull requests"));
+    }
+
+    #[test]
+    fn narrow_terminals_clip_content_and_render_each_screen() {
+        let mut app = authed_app();
+        app.repos = Load::Loaded(vec![sample_repo()]);
+        app.refilter();
+        app.repos_state.select(Some(0));
+        let narrow = rendered(&mut app, 24, 8);
+        assert!(narrow.contains("user-64bit/github"));
+        assert!(!narrow.contains("Rust"));
+
+        app.search_active = true;
+        app.search_query = "a query wider than this terminal".to_string();
+        for screen in [Screen::Repos, Screen::RepoDetail, Screen::MyPulls] {
+            app.screen = screen;
+            for (width, height) in [(24, 8), (1, 1)] {
+                assert!(!rendered(&mut app, width, height).is_empty());
+                app.show_help = true;
+                assert!(!rendered(&mut app, width, height).is_empty());
+                app.show_help = false;
+            }
+        }
     }
 }
