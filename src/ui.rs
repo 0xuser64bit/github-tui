@@ -1,5 +1,5 @@
 //! All rendering. Pure presentation: reads [`App`] state and draws it, with the
-//! sole exception of mutating `ListState`s, which stateful widgets require.
+//! exceptions of updating widget `ListState`s and clamping preview scrolling.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -17,31 +17,67 @@ const CLOSED: Color = Color::Magenta;
 /// Entry point: lay out header / body / footer and draw the active screen.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-
-    let (header_area, search_area, body_area, footer_area) = if app.search_active {
-        let chunks = Layout::vertical([
-            Constraint::Length(1), // header
-            Constraint::Length(1), // search bar
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
-        (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+    let progress = app.progress();
+    let mut notices = Vec::new();
+    let actions = if app.search_active {
+        "Esc then r refresh"
     } else {
-        let chunks = Layout::vertical([
-            Constraint::Length(1), // header
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
-        (chunks[0], None, chunks[1], chunks[2])
+        "r refresh"
     };
+    if progress.error.is_some() {
+        notices.push(if progress.next.is_some() {
+            format!("{actions}; n load next page")
+        } else {
+            actions.to_string()
+        });
+    } else if progress.next.is_some() && !progress.loading() {
+        notices.push(
+            if app.search_active {
+                "Esc then n: load next page"
+            } else {
+                "n: load next page"
+            }
+            .to_string(),
+        );
+    }
+    if let Some(error) = &progress.error {
+        notices.push(format!("{error} Loaded rows retained."));
+    }
+    if let Some(warning) = &progress.warning {
+        notices.push(warning.clone());
+    }
+    if progress.loading() {
+        notices.push(format!("{} Fetching…", app.spinner()));
+    } else if progress.next.is_some() {
+        notices.push("More results available. Search filters loaded rows.".to_string());
+    }
+    let notice = notices.join("\n");
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(app.search_active)),
+        Constraint::Min(0),
+        Constraint::Length(if notice.is_empty() {
+            0
+        } else {
+            notices.len().min(4) as u16 + 1
+        }),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let (header_area, body_area, footer_area) = (chunks[0], chunks[2], chunks[4]);
 
     render_header(frame, app, header_area);
 
-    if let Some(search_area) = search_area {
-        render_search_bar(frame, app, search_area);
+    if app.search_active {
+        render_search_bar(frame, app, chunks[1]);
     }
+
+    frame.render_widget(
+        Paragraph::new(notice)
+            .wrap(Wrap { trim: false })
+            .style(Style::new().fg(Color::Yellow)),
+        chunks[3],
+    );
 
     if app.needs_auth() {
         render_auth_required(frame, body_area);
@@ -55,6 +91,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_footer(frame, app, footer_area);
 
+    if app.preview_open {
+        render_preview(frame, app, area);
+    }
     if app.show_help {
         render_help(frame, area);
     }
@@ -86,7 +125,24 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 Tab::Pulls => "Pull Requests",
             }));
         }
-        Screen::MyPulls => spans.push(Span::raw("My Pull Requests")),
+        Screen::MyPulls => spans.push(Span::raw(if app.review_mode {
+            "Review Requests"
+        } else {
+            "My Pull Requests"
+        })),
+    }
+    if app.screen != Screen::Repos {
+        let (visible, loaded) = match app.screen {
+            Screen::RepoDetail if app.tab == Tab::Issues => {
+                (app.filtered_issues.len(), app.issues.len())
+            }
+            Screen::RepoDetail => (app.filtered_pulls.len(), app.pulls.len()),
+            _ => (app.filtered_my_pulls.len(), app.my_pulls.len()),
+        };
+        spans.push(Span::raw(format!(
+            " · {} · {visible}/{loaded} loaded",
+            app.state_filter.label()
+        )));
     }
 
     frame.render_widget(
@@ -117,6 +173,14 @@ fn render_repos(frame: &mut Frame, app: &mut App, area: Rect) {
             render_status_box(frame, area, block, &loading(app, "repositories"))
         }
         Load::Failed(message) => render_status_box(frame, area, block, &failure(message)),
+        Load::Loaded(repos) if repos.is_empty() && app.repos_progress.next.is_some() => {
+            render_status_box(
+                frame,
+                area,
+                block,
+                &Text::from("No repositories on this page. More results are available."),
+            )
+        }
         Load::Loaded(repos) if repos.is_empty() => {
             render_status_box(frame, area, block, &Text::from("No repositories found."))
         }
@@ -151,6 +215,14 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 render_status_box(frame, rows[1], block, &loading(app, "issues"))
             }
             Load::Failed(message) => render_status_box(frame, rows[1], block, &failure(message)),
+            Load::Loaded(items) if items.is_empty() && app.issues_progress.next.is_some() => {
+                render_status_box(
+                    frame,
+                    rows[1],
+                    block,
+                    &Text::from("No issues on this page. More results are available."),
+                )
+            }
             Load::Loaded(items) if items.is_empty() => {
                 render_status_box(frame, rows[1], block, &Text::from("No issues."))
             }
@@ -174,6 +246,14 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 render_status_box(frame, rows[1], block, &loading(app, "pull requests"))
             }
             Load::Failed(message) => render_status_box(frame, rows[1], block, &failure(message)),
+            Load::Loaded(items) if items.is_empty() && app.pulls_progress.next.is_some() => {
+                render_status_box(
+                    frame,
+                    rows[1],
+                    block,
+                    &Text::from("No pull requests on this page. More results are available."),
+                )
+            }
             Load::Loaded(items) if items.is_empty() => {
                 render_status_box(frame, rows[1], block, &Text::from("No pull requests."))
             }
@@ -203,13 +283,25 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_my_pulls(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::bordered()
         .border_style(Style::new().dim())
-        .title(Line::from(" My Pull Requests "));
+        .title(if app.review_mode {
+            " Review Requests "
+        } else {
+            " My Pull Requests "
+        });
 
     match &app.my_pulls {
         Load::Idle | Load::Loading => {
             render_status_box(frame, area, block, &loading(app, "pull requests"))
         }
         Load::Failed(message) => render_status_box(frame, area, block, &failure(message)),
+        Load::Loaded(items) if items.is_empty() && app.my_pulls_progress.next.is_some() => {
+            render_status_box(
+                frame,
+                area,
+                block,
+                &Text::from("No pull requests on this page. More results are available."),
+            )
+        }
         Load::Loaded(items) if items.is_empty() => {
             render_status_box(frame, area, block, &Text::from("No pull requests found."))
         }
@@ -274,13 +366,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.screen {
             Screen::Repos => {
-                " ↑↓ move · enter open · m my PRs · / search · o browser · r refresh · ? help · q quit"
+                " enter open · m my PRs · v reviews · / search · n next · r refresh · ? help"
             }
             Screen::RepoDetail => {
-                " ↑↓ move · tab switch · / search · enter/o browser · esc back · r refresh · q quit"
+                " p preview · enter/o browser · s state · n next · tab switch · Esc back · ? help"
             }
             Screen::MyPulls => {
-                " ↑↓ move · / search · enter/o browser · esc back · r refresh · ? help · q quit"
+                " p preview · enter/o browser · s state · n next · Esc back · ? help"
             }
         }
     };
@@ -304,7 +396,11 @@ fn render_auth_required(frame: &mut Frame, area: Rect) {
         Line::from("  • run `gh auth login` with the GitHub CLI"),
         Line::from(""),
         Line::from(Span::styled(
-            "A read-only (repo) scope is sufficient.",
+            "Prefer a fine-grained token limited to the repositories you need,",
+            Style::new().dim(),
+        )),
+        Line::from(Span::styled(
+            "with read-only Issues and Pull requests permissions.",
             Style::new().dim(),
         )),
     ]);
@@ -318,7 +414,7 @@ fn render_auth_required(frame: &mut Frame, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(area, 56, 17);
+    let popup = centered_rect(area, 64, 19);
     frame.render_widget(Clear, popup);
 
     let rows = [
@@ -328,9 +424,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("Esc / h / ←", "Back to repository list"),
         ("Tab", "Switch Issues / Pull Requests"),
         ("m", "View your pull requests"),
+        ("v", "View requested reviews"),
+        ("p", "Preview selected issue / pull request"),
         ("/", "Search / filter the current list"),
+        ("s", "Cycle all / open / closed / merged"),
         ("o", "Open current selection in browser"),
         ("r", "Refresh the current view"),
+        ("n", "Load the next page (keeps loaded rows)"),
         ("?", "Toggle this help"),
         ("q / Ctrl-C", "Quit"),
     ];
@@ -350,11 +450,57 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
 }
 
+fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
+    let popup = centered_rect(area, 90, 30);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(ACCENT))
+        .title(" Preview · j/k scroll · o browser · r retry · Esc close ")
+        .title_bottom(" Esc close ");
+    let inner = block.inner(popup);
+
+    let text = match &app.preview {
+        Load::Idle | Load::Loading => loading(app, "preview"),
+        Load::Failed(message) => failure(message),
+        Load::Loaded(item) => {
+            let state = if item.state == "closed" && app.preview_state == "merged" {
+                "merged"
+            } else {
+                item.state.as_str()
+            };
+            let author = item.user.as_ref().map_or("unknown", |user| &user.login);
+            let body = item
+                .body
+                .as_deref()
+                .filter(|body| !body.trim().is_empty())
+                .unwrap_or("No description provided.");
+            let mut lines = vec![
+                Line::styled(
+                    format!("{} #{}: {}", app.preview_repo, item.number, item.title),
+                    Style::new().bold().fg(ACCENT),
+                ),
+                Line::from(vec![state_dot(state), Span::raw(format!("by {author}"))]),
+                Line::default(),
+            ];
+            lines.extend(body.lines().map(Line::from));
+            Text::from(lines)
+        }
+    };
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+    // line_count includes border height, but wrapping needs the inner width.
+    let max_scroll = paragraph
+        .line_count(inner.width)
+        .saturating_sub(popup.height as usize)
+        .min(u16::MAX as usize) as u16;
+    app.preview_scroll = app.preview_scroll.min(max_scroll);
+    frame.render_widget(paragraph.scroll((app.preview_scroll, 0)), popup);
+}
+
 // --- item builders ---------------------------------------------------------
 
 fn repo_item(repo: &Repo) -> ListItem<'static> {
     let mut spans = vec![Span::styled(
-        repo.name.clone(),
+        repo.full_name.clone(),
         Style::new().bold().fg(ACCENT),
     )];
     for (flag, label, color) in [
@@ -442,7 +588,7 @@ fn state_dot(state: &str) -> Span<'static> {
         "merged" => Color::Cyan,
         _ => CLOSED,
     };
-    Span::styled("● ", Style::new().fg(color))
+    Span::styled(format!("● {state} "), Style::new().fg(color))
 }
 
 // --- small helpers ---------------------------------------------------------
@@ -483,7 +629,7 @@ fn failure(message: &str) -> Text<'static> {
 
 fn count_badge<T>(load: &Load<Vec<T>>) -> String {
     match load {
-        Load::Loaded(items) => format!("({})", items.len()),
+        Load::Loaded(items) => format!("({} loaded)", items.len()),
         Load::Loading => "(…)".to_string(),
         _ => String::new(),
     }
@@ -504,15 +650,15 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::github::Github;
-    use crate::models::{Issue, PullRequest, User};
+    use crate::models::{Issue, ItemDetail, PullRequest, User};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::sync::mpsc;
 
-    /// Render `app` into an 80x24 test buffer and return its text content.
+    /// Render `app` into a test buffer and return its text content.
     /// Panics in `render` (layout/index bugs) fail the test here.
-    fn rendered(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    fn rendered(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
         terminal
             .backend()
@@ -542,13 +688,32 @@ mod tests {
         }
     }
 
+    fn preview_app(body: Option<&str>) -> App {
+        let mut app = authed_app();
+        app.preview_open = true;
+        app.preview_repo = "octocat/project".to_string();
+        app.preview_state = "merged".to_string();
+        app.preview = Load::Loaded(ItemDetail {
+            number: 7,
+            title: "Preview title".to_string(),
+            state: "closed".to_string(),
+            body: body.map(str::to_string),
+            user: Some(User {
+                login: "octocat".to_string(),
+            }),
+        });
+        app
+    }
+
     #[test]
     fn auth_screen_explains_how_to_authenticate() {
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(None, tx);
-        let text = rendered(&mut app);
+        let text = rendered(&mut app, 80, 24);
         assert!(text.contains("No GitHub token found"));
         assert!(text.contains("GITHUB_TOKEN"));
+        assert!(text.contains("fine-grained token limited to the repositories you need"));
+        assert!(text.contains("read-only Issues and Pull requests permissions"));
     }
 
     #[test]
@@ -556,14 +721,14 @@ mod tests {
         let mut app = authed_app();
         // Loading state shows the spinner copy.
         app.repos = Load::Loading;
-        assert!(rendered(&mut app).contains("Loading repositories"));
+        assert!(rendered(&mut app, 80, 24).contains("Loading repositories"));
 
         // Loaded state shows the repo and its metadata.
         app.repos = Load::Loaded(vec![sample_repo()]);
         app.refilter();
         app.repos_state.select(Some(0));
-        let text = rendered(&mut app);
-        assert!(text.contains("github-tui"));
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("user-64bit/github-tui"));
         assert!(text.contains("Rust"));
     }
 
@@ -571,7 +736,7 @@ mod tests {
     fn failed_repos_show_retry_hint() {
         let mut app = authed_app();
         app.repos = Load::Failed("Network error: offline".to_string());
-        let text = rendered(&mut app);
+        let text = rendered(&mut app, 80, 24);
         assert!(text.contains("Network error"));
         assert!(text.contains("retry"));
     }
@@ -605,13 +770,15 @@ mod tests {
         }]);
         app.refilter();
 
-        let issues_view = rendered(&mut app);
+        let issues_view = rendered(&mut app, 80, 24);
+        assert!(issues_view.contains("● open"));
         assert!(issues_view.contains("#42"));
         assert!(issues_view.contains("fix the crash"));
         assert!(issues_view.contains("octocat"));
 
         app.tab = Tab::Pulls;
-        let pulls_view = rendered(&mut app);
+        let pulls_view = rendered(&mut app, 80, 24);
+        assert!(pulls_view.contains("● open"));
         assert!(pulls_view.contains("#7"));
         assert!(pulls_view.contains("add tests"));
         assert!(pulls_view.contains("[draft]"));
@@ -621,6 +788,247 @@ mod tests {
     fn help_overlay_renders() {
         let mut app = authed_app();
         app.show_help = true;
-        assert!(rendered(&mut app).contains("Keybindings"));
+        assert!(rendered(&mut app, 80, 24).contains("Keybindings"));
+    }
+
+    #[test]
+    fn repository_owners_disambiguate_matching_names() {
+        let mut app = authed_app();
+        let mut first = sample_repo();
+        first.full_name = "alice/github-tui".to_string();
+        let mut second = first.clone();
+        second.full_name = "bob/github-tui".to_string();
+        app.repos = Load::Loaded(vec![first, second]);
+        app.refilter();
+
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("alice/github-tui"));
+        assert!(text.contains("bob/github-tui"));
+    }
+
+    #[test]
+    fn search_bar_and_filtered_results_render() {
+        let mut app = authed_app();
+        let mut kept = sample_repo();
+        kept.name = "kept".to_string();
+        kept.full_name = "alice/kept".to_string();
+        let mut hidden = sample_repo();
+        hidden.full_name = "bob/hidden".to_string();
+        app.repos = Load::Loaded(vec![kept, hidden]);
+        app.search_active = true;
+        app.search_query = "kept".to_string();
+        app.refilter();
+
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("/ kept█"));
+        assert!(text.contains("alice/kept"));
+        assert!(!text.contains("bob/hidden"));
+
+        app.search_query = "missing".to_string();
+        app.refilter();
+        assert!(rendered(&mut app, 80, 24).contains("No matching repositories"));
+    }
+
+    #[test]
+    fn my_pulls_render_text_states_and_load_states() {
+        let mut app = authed_app();
+        app.screen = Screen::MyPulls;
+        app.my_pulls = Load::Loaded(
+            serde_json::from_str(
+                r#"[
+                    {"number":7,"title":"first","state":"open","draft":true,
+                     "repository_url":"https://api.github.com/repos/octocat/project",
+                     "user":{"login":"octocat"}},
+                    {"number":8,"title":"second","state":"closed"},
+                    {"number":9,"title":"third","state":"closed",
+                     "pull_request":{"merged_at":"2024-01-01T00:00:00Z"}}
+                ]"#,
+            )
+            .unwrap(),
+        );
+        app.refilter();
+
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("My Pull Requests"));
+        assert!(text.contains("octocat/project"));
+        assert!(text.contains("[draft]"));
+        assert!(text.contains("● open"));
+        assert!(text.contains("● closed"));
+        assert!(text.contains("● merged"));
+
+        app.search_active = true;
+        app.search_query = "missing".to_string();
+        app.refilter();
+        assert!(rendered(&mut app, 80, 24).contains("No matching pull requests"));
+
+        app.my_pulls = Load::Loaded(vec![]);
+        assert!(rendered(&mut app, 80, 24).contains("No pull requests found"));
+        app.my_pulls = Load::Failed("Network error: offline".to_string());
+        let failed = rendered(&mut app, 80, 24);
+        assert!(failed.contains("Network error: offline"));
+        assert!(failed.contains("Press r to retry"));
+        app.my_pulls = Load::Loading;
+        assert!(rendered(&mut app, 80, 24).contains("Loading pull requests"));
+    }
+
+    #[test]
+    fn narrow_terminals_clip_content_and_render_each_screen() {
+        let mut app = authed_app();
+        app.repos = Load::Loaded(vec![sample_repo()]);
+        app.refilter();
+        app.repos_state.select(Some(0));
+        let narrow = rendered(&mut app, 24, 8);
+        assert!(narrow.contains("user-64bit/github"));
+        assert!(!narrow.contains("Rust"));
+
+        app.search_active = true;
+        app.search_query = "a query wider than this terminal".to_string();
+        for screen in [Screen::Repos, Screen::RepoDetail, Screen::MyPulls] {
+            app.screen = screen;
+            for (width, height) in [(24, 8), (1, 1)] {
+                assert!(!rendered(&mut app, width, height).is_empty());
+                app.show_help = true;
+                assert!(!rendered(&mut app, width, height).is_empty());
+                app.show_help = false;
+            }
+        }
+    }
+    #[test]
+    fn pagination_failure_keeps_rows_and_visible_recovery_actions() {
+        let mut app = authed_app();
+        app.repos = Load::Loaded(vec![sample_repo()]);
+        app.refilter();
+        app.repos_progress.error =
+            Some("A long network error that should never hide the recovery controls".to_string());
+        let text = rendered(&mut app, 24, 14);
+        assert!(text.contains("r refresh"));
+        assert!(!text.contains("n load next page"));
+        assert!(text.contains("user-64bit/github"));
+        app.repos_progress.next = Some("https://api.github.com/user/repos?page=2".to_string());
+        assert!(rendered(&mut app, 80, 24).contains("n load next page"));
+        app.search_active = true;
+        assert!(rendered(&mut app, 80, 24).contains("Esc then r refresh"));
+    }
+
+    #[test]
+    fn incomplete_search_and_empty_continuation_are_visible() {
+        let mut app = authed_app();
+        app.screen = Screen::MyPulls;
+        app.my_pulls = Load::Loaded(vec![]);
+        app.my_pulls_progress.next =
+            Some("https://api.github.com/search/issues?page=2".to_string());
+        app.my_pulls_progress.warning =
+            Some("GitHub Search timed out; this list may be incomplete.".to_string());
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("No pull requests on this page"));
+        assert!(text.contains("incomplete"));
+        assert!(text.contains("n: load next page"));
+    }
+
+    #[test]
+    fn review_requests_use_their_own_heading_and_search() {
+        let mut app = authed_app();
+        app.screen = Screen::MyPulls;
+        app.review_mode = true;
+        app.my_pulls = Load::Loaded(
+            serde_json::from_str(
+                r#"[{"number":7,"title":"review this","state":"open",
+                     "repository_url":"https://api.github.com/repos/octocat/project"}]"#,
+            )
+            .unwrap(),
+        );
+        app.search_active = true;
+        app.search_query = "review".to_string();
+        app.refilter();
+
+        let text = rendered(&mut app, 80, 24);
+        assert_eq!(text.matches("Review Requests").count(), 2);
+        assert!(!text.contains("My Pull Requests"));
+        assert!(text.contains("/ review█"));
+        assert!(text.contains("review this"));
+        assert!(text.contains("octocat/project"));
+    }
+
+    #[test]
+    fn preview_renders_plain_multiline_body_and_effective_state() {
+        let mut app = preview_app(Some(
+            "First paragraph\n\n# Plain heading\nliteral **stars**",
+        ));
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("Preview · j/k scroll"));
+        assert!(text.contains("octocat/project #7: Preview title"));
+        assert!(text.contains("● merged"));
+        assert!(text.contains("by octocat"));
+        assert!(text.contains("First paragraph"));
+        assert!(text.contains("# Plain heading"));
+        assert!(text.contains("literal **stars**"));
+
+        app.preview_open = false;
+        assert!(!rendered(&mut app, 80, 24).contains("Preview title"));
+    }
+
+    #[test]
+    fn preview_shows_empty_loading_and_failure_states() {
+        for body in [None, Some(""), Some(" \n\t")] {
+            let mut app = preview_app(body);
+            assert!(rendered(&mut app, 80, 24).contains("No description provided"));
+        }
+
+        let mut app = preview_app(None);
+        app.preview = Load::Idle;
+        assert!(rendered(&mut app, 80, 24).contains("Loading preview"));
+        app.preview = Load::Loading;
+        assert!(rendered(&mut app, 80, 24).contains("Loading preview"));
+        app.preview = Load::Failed("Could not load the description.".to_string());
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("Could not load the description"));
+        assert!(text.contains("Press r to retry"));
+    }
+
+    #[test]
+    fn preview_scrolls_long_content_and_fits_small_terminals() {
+        let mut app = preview_app(Some("first body line\nsecond body line\nlast body line"));
+        app.preview_scroll = 3;
+        let text = rendered(&mut app, 40, 6);
+        assert!(text.contains("first body line"));
+        assert!(text.contains("last body line"));
+        assert!(!text.contains("Preview title"));
+
+        let long = format!(
+            "{}\nLast visible line",
+            "a very long description ".repeat(200)
+        );
+        app.preview = Load::Loaded(ItemDetail {
+            number: 7,
+            title: "A long title that wraps over multiple lines".to_string(),
+            state: "open".to_string(),
+            body: Some(long),
+            user: None,
+        });
+        for (width, height) in [(80, 10), (24, 8)] {
+            app.preview_scroll = u16::MAX;
+            let text = rendered(&mut app, width, height);
+            assert!(app.preview_scroll < u16::MAX);
+            assert!(text.contains("Last visible line"));
+            assert!(!text.contains("Preview title"));
+        }
+        assert!(!rendered(&mut app, 1, 1).is_empty());
+        assert!(rendered(&mut app, 24, 8).contains("Esc close"));
+    }
+    #[test]
+    fn preview_uses_the_freshly_fetched_state() {
+        let mut app = preview_app(Some("Details"));
+        app.preview_state = "open".to_string();
+        if let Load::Loaded(item) = &mut app.preview {
+            item.state = "closed".to_string();
+        }
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("● closed"));
+        assert!(!text.contains("● open"));
+        app.preview_state = "merged".to_string();
+        if let Load::Loaded(item) = &mut app.preview {
+            item.state = "open".to_string();
+        }
+        assert!(rendered(&mut app, 80, 24).contains("● open"));
     }
 }

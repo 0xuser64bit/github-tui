@@ -5,10 +5,10 @@ description = "A read-only terminal UI for browsing GitHub repositories, issues,
 authors = ["user-64bit <arth.prajapati@outlook.com>"]
 license = "MIT"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
-ratatui = "0.30.0"
+ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 color-eyre = "0.6.5"
 # Blocking HTTP with rustls (no OpenSSL); run on worker threads, not an async runtime.
 ureq = { version = "3.3", features = ["json"] }
