@@ -79,7 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
       - name: Test minimum supported Rust version
