@@ -53,12 +53,18 @@ not their previous position in a refreshed result set.
 
 ### 2. Identity-stable selection
 
-- [ ] Reproduce wrong selections after refreshed repositories, issues, PRs, and
+- [x] Reproduce wrong selections after refreshed repositories, issues, PRs, and
   personal queues reorder; cover query changes and missing selections.
-- [ ] Preserve each list's selected identity through message application and
+- [x] Preserve each list's selected identity through message application and
   refiltering, retaining existing empty and fallback behavior.
-- [ ] Update usage documentation; run the full stable/MSRV/documentation/release
+- [x] Update usage documentation; run the full stable/MSRV/documentation/release
   and dependency-audit checks; commit the complete unit.
+
+Verified locally: 106 unit tests on stable and Rust 1.88.0, Clippy with warnings
+denied, formatting, rustdoc with warnings denied, release build, RustSec audit
+(266 dependencies, no vulnerabilities reported), and the credentialed live
+smoke test. Reordering regressions failed on the previous implementation before
+the identity-preserving fix.
 
 ### Delivery
 

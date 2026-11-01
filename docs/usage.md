@@ -265,6 +265,10 @@ List endpoints request **100 items per page**. The app does not fetch the entire
 - If a later page fails, the rows already on screen stay visible. The notice offers a retry; `n` retries the same continuation.
 - If GitHub repeats a pagination link, paging stops with an error instead of looping.
 - The app coalesces refresh requests while a request is in flight and ignores responses for a view you have left.
+- A successful refresh keeps the same resource highlighted even when rows reorder. Narrowing or clearing search also keeps that resource selected if it remains visible. If it disappears, selection moves to the first visible row; empty lists have no selection.
+- Searching one list does not change selections in hidden tabs or personal queues.
+
+Network work is bounded to four concurrent fetches and sixteen queued fetches per session. Leaving a repository or closing a preview cancels its queued fetches. Already-running requests may finish, but their stale results are ignored. If the queue is full, the app shows a retryable error; press `r` to retry after current work finishes. Keeping a personal queue in the background intentionally lets its request finish.
 
 A failed **refresh** never clears a successfully loaded list. An initial load that fails shows the error in place of the list, with a retry path through `r`.
 

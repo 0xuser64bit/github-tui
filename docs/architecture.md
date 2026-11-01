@@ -111,7 +111,9 @@ The app stores an error on a **loaded** list in `ListProgress.error` instead of 
 
 ### Selection and filtering
 
-Lists use Ratatui's `ListState` over *filtered index vectors* (`filtered_repos`, `filtered_issues`, and so on). The indices point back into the loaded data, so filtering never copies or reorders the source list. `refilter` rebuilds those vectors from the current query and state filter, then clamps the cursor to the visible length.
+Lists use Ratatui's `ListState` over *filtered index vectors* (`filtered_repos`, `filtered_issues`, and so on). The indices point back into the loaded data, so filtering never copies or reorders the source list. Before applying a result or rebuilding filters, the app records every selected resource's identity: repository full name, issue/PR number, or `(repository, number)` for personal queues. After rebuilding, it restores that identity's visible position. A missing selection falls back to the first visible row, or no selection when the list is empty.
+
+Only the active list receives the current query and state filter. Hidden tabs and queues retain unfiltered membership and identity-based selections, including when their results arrive while another screen has a search active. Clearing search does not first discard the old index vectors: they are needed to identify the highlighted resource before rebuilding.
 
 Search is a case-insensitive substring match over loaded data only. Issues and PRs match title, author, and number (the app strips an optional leading `#` from the number query). Repositories match name, full name, and description. Personal PR queues also match repository names.
 
