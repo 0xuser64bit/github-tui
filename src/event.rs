@@ -3,7 +3,7 @@
 //! A single [`mpsc`] channel multiplexes three sources:
 //!   * an input thread forwarding terminal events,
 //!   * a tick thread driving spinner animation,
-//!   * on-demand worker threads posting [`Message`]s with fetch results.
+//!   * bounded request workers posting [`Message`]s with fetch results.
 //!
 //! The UI thread simply blocks on [`Events::next`] and never performs network
 //! work itself, so a slow request can never freeze rendering or input.

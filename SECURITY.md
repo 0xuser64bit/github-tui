@@ -42,6 +42,7 @@ The token is still visible to anything that can inspect your environment or proc
 - The client validates pagination continuations against the GitHub API scheme and authority before attaching the bearer token.
 - The client may preserve authorization across same-host redirects; it does not forward authorization to another host.
 - Requests have a 20-second timeout and bounded response bodies.
+- A session runs at most four network fetches concurrently with at most sixteen queued. Abandoned queued requests are cancelled, and a full queue reports a retryable error without blocking the UI.
 - There is no telemetry, analytics, update check, or hidden third-party request.
 - The app restricts browser launches to canonical `https://github.com/...` URLs with no query string and a conservative path character set.
 

@@ -19,6 +19,7 @@ use ratatui::widgets::ListState;
 use crate::event::{Event, Events, Message};
 use crate::github::{Github, Page};
 use crate::models::{Issue, ItemDetail, PullRequest, Repo, SearchedPullRequest, User};
+use crate::requests::{Cancellation, RequestPool};
 use crate::ui;
 
 /// The async loading state of a piece of remote data.
@@ -61,6 +62,7 @@ impl<U> Load<Vec<U>> {
 struct Request {
     generation: u64,
     in_flight: bool,
+    cancellation: Cancellation,
 }
 
 impl Request {
@@ -70,6 +72,7 @@ impl Request {
         }
         self.generation = self.generation.wrapping_add(1);
         self.in_flight = true;
+        self.cancellation = Cancellation::default();
         Some(self.generation)
     }
 
@@ -82,6 +85,7 @@ impl Request {
     }
 
     fn invalidate(&mut self) {
+        self.cancellation.cancel();
         self.generation = self.generation.wrapping_add(1);
         self.in_flight = false;
     }
@@ -188,6 +192,13 @@ pub(crate) enum StateFilter {
     Merged,
 }
 
+struct Selections {
+    repos: Option<String>,
+    issues: Option<u64>,
+    pulls: Option<u64>,
+    my_pulls: Option<(String, u64)>,
+}
+
 impl StateFilter {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -212,6 +223,7 @@ pub struct App {
     pub(crate) running: bool,
     client: Option<Github>,
     sender: Sender<Event>,
+    request_pool: RequestPool,
 
     pub(crate) user: Load<User>,
     pub(crate) repos: Load<Vec<Repo>>,
@@ -268,6 +280,7 @@ impl App {
             running: false,
             client,
             sender,
+            request_pool: RequestPool::default(),
             user: Load::Idle,
             repos: Load::Idle,
             repos_state: ListState::default(),
@@ -459,6 +472,7 @@ impl App {
     }
 
     fn on_message(&mut self, message: Message) {
+        let selections = self.selections();
         let updated = match message {
             Message::User { request, result } => {
                 if !self.user_request.finish(request) {
@@ -512,7 +526,7 @@ impl App {
             _ => false,
         };
         if updated {
-            self.refilter();
+            self.refilter_with_selections(selections);
         }
     }
 
@@ -739,16 +753,45 @@ impl App {
         self.search_active = false;
         self.search_query.clear();
         self.state_filter = StateFilter::All;
-        self.filtered_repos.clear();
-        self.filtered_issues.clear();
-        self.filtered_pulls.clear();
-        self.filtered_my_pulls.clear();
         self.refilter();
+    }
+
+    fn selections(&self) -> Selections {
+        Selections {
+            repos: selected_key(
+                &self.repos,
+                &self.filtered_repos,
+                &self.repos_state,
+                |repo| repo.full_name.clone(),
+            ),
+            issues: selected_key(
+                &self.issues,
+                &self.filtered_issues,
+                &self.issues_state,
+                |issue| issue.number,
+            ),
+            pulls: selected_key(
+                &self.pulls,
+                &self.filtered_pulls,
+                &self.pulls_state,
+                |pull| pull.number,
+            ),
+            my_pulls: selected_key(
+                &self.my_pulls,
+                &self.filtered_my_pulls,
+                &self.my_pulls_state,
+                |pull| (pull.repo(), pull.number),
+            ),
+        }
     }
 
     /// Rebuild the filtered index vectors for the current screen from the
     /// loaded data and the search query. Case-insensitive substring match.
     pub(crate) fn refilter(&mut self) {
+        self.refilter_with_selections(self.selections());
+    }
+
+    fn refilter_with_selections(&mut self, selections: Selections) {
         let query = self.search_query.to_lowercase();
 
         // Repos — always refilter so the repo list stays consistent.
@@ -757,7 +800,8 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| {
-                    query.is_empty()
+                    self.screen != Screen::Repos
+                        || query.is_empty()
                         || r.name.to_lowercase().contains(&query)
                         || r.full_name.to_lowercase().contains(&query)
                         || r.description
@@ -778,8 +822,10 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, issue)| {
-                    self.state_filter.matches(&issue.state)
-                        && matches_item(&query, &issue.title, issue.author(), issue.number)
+                    self.screen != Screen::RepoDetail
+                        || self.tab != Tab::Issues
+                        || (self.state_filter.matches(&issue.state)
+                            && matches_item(&query, &issue.title, issue.author(), issue.number))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -793,8 +839,10 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, pr)| {
-                    self.state_filter.matches(pr.effective_state())
-                        && matches_item(&query, &pr.title, pr.author(), pr.number)
+                    self.screen != Screen::RepoDetail
+                        || self.tab != Tab::Pulls
+                        || (self.state_filter.matches(pr.effective_state())
+                            && matches_item(&query, &pr.title, pr.author(), pr.number))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -808,9 +856,10 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, pr)| {
-                    self.state_filter.matches(pr.effective_state())
-                        && (matches_item(&query, &pr.title, pr.author(), pr.number)
-                            || pr.repo().to_lowercase().contains(&query))
+                    self.screen != Screen::MyPulls
+                        || (self.state_filter.matches(pr.effective_state())
+                            && (matches_item(&query, &pr.title, pr.author(), pr.number)
+                                || pr.repo().to_lowercase().contains(&query)))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -818,23 +867,52 @@ impl App {
             self.filtered_my_pulls.clear();
         }
 
-        // Clamp cursor for the active list.
-        let (state, len) = match self.screen {
-            Screen::Repos => (&mut self.repos_state, self.filtered_repos.len()),
-            Screen::RepoDetail => match self.tab {
-                Tab::Issues => (&mut self.issues_state, self.filtered_issues.len()),
-                Tab::Pulls => (&mut self.pulls_state, self.filtered_pulls.len()),
-            },
-            Screen::MyPulls => (&mut self.my_pulls_state, self.filtered_my_pulls.len()),
-        };
-        if len == 0 {
-            state.select(None);
-        } else if state.selected().is_none_or(|i| i >= len) {
-            state.select(Some(0));
-        }
+        restore_selection(
+            &self.repos,
+            &self.filtered_repos,
+            &mut self.repos_state,
+            selections.repos,
+            |repo| repo.full_name.clone(),
+        );
+        restore_selection(
+            &self.issues,
+            &self.filtered_issues,
+            &mut self.issues_state,
+            selections.issues,
+            |issue| issue.number,
+        );
+        restore_selection(
+            &self.pulls,
+            &self.filtered_pulls,
+            &mut self.pulls_state,
+            selections.pulls,
+            |pull| pull.number,
+        );
+        restore_selection(
+            &self.my_pulls,
+            &self.filtered_my_pulls,
+            &mut self.my_pulls_state,
+            selections.my_pulls,
+            |pull| (pull.repo(), pull.number),
+        );
     }
 
-    // --- fetches (each spawns a worker thread) -----------------------------
+    // --- fetches (dispatched to bounded workers) ---------------------------
+
+    fn dispatch<T: Send + 'static>(
+        &mut self,
+        cancellation: Cancellation,
+        fetch: impl FnOnce() -> Result<T, String> + Send + 'static,
+        message: impl FnOnce(Result<T, String>) -> Message + Send + Clone + 'static,
+    ) {
+        let sender = self.sender.clone();
+        let rejected = message.clone();
+        if let Err(error) = self.request_pool.execute(cancellation, move || {
+            let _ = sender.send(Event::Message(message(fetch())));
+        }) {
+            self.on_message(rejected(Err(error)));
+        }
+    }
 
     fn fetch_user(&mut self) {
         let Some(client) = self.client.clone() else {
@@ -844,13 +922,11 @@ impl App {
             return;
         };
         self.user = Load::Loading;
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let _ = sender.send(Event::Message(Message::User {
-                request,
-                result: client.current_user(),
-            }));
-        });
+        self.dispatch(
+            self.user_request.cancellation.clone(),
+            move || client.current_user(),
+            move |result| Message::User { request, result },
+        );
     }
 
     fn fetch_repos(&mut self, more: bool) {
@@ -863,11 +939,11 @@ impl App {
         if !matches!(self.repos, Load::Loaded(_)) {
             self.repos = Load::Loading;
         }
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let result = client.repos_page(next.as_deref());
-            let _ = sender.send(Event::Message(Message::Repos { request, result }));
-        });
+        self.dispatch(
+            self.repos_progress.request.cancellation.clone(),
+            move || client.repos_page(next.as_deref()),
+            move |result| Message::Repos { request, result },
+        );
     }
 
     fn fetch_issues(&mut self, repo: &Repo, more: bool) {
@@ -882,15 +958,15 @@ impl App {
         if !matches!(self.issues, Load::Loaded(_)) {
             self.issues = Load::Loading;
         }
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let result = client.issues_page(&owner, &name, next.as_deref());
-            let _ = sender.send(Event::Message(Message::Issues {
+        self.dispatch(
+            self.issues_progress.request.cancellation.clone(),
+            move || client.issues_page(&owner, &name, next.as_deref()),
+            move |result| Message::Issues {
                 request,
                 repo: full,
                 result,
-            }));
-        });
+            },
+        );
     }
 
     fn fetch_pulls(&mut self, repo: &Repo, more: bool) {
@@ -905,15 +981,15 @@ impl App {
         if !matches!(self.pulls, Load::Loaded(_)) {
             self.pulls = Load::Loading;
         }
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let result = client.pulls_page(&owner, &name, next.as_deref());
-            let _ = sender.send(Event::Message(Message::Pulls {
+        self.dispatch(
+            self.pulls_progress.request.cancellation.clone(),
+            move || client.pulls_page(&owner, &name, next.as_deref()),
+            move |result| Message::Pulls {
                 request,
                 repo: full,
                 result,
-            }));
-        });
+            },
+        );
     }
 
     fn fetch_my_pulls(&mut self, more: bool) {
@@ -938,16 +1014,18 @@ impl App {
         if !matches!(self.my_pulls, Load::Loaded(_)) {
             self.my_pulls = Load::Loading;
         }
-        let sender = self.sender.clone();
         let review = self.review_mode;
-        thread::spawn(move || {
-            let result = if review {
-                client.review_pulls_page(&login, next.as_deref())
-            } else {
-                client.my_pulls_page(&login, next.as_deref())
-            };
-            let _ = sender.send(Event::Message(Message::MyPulls { request, result }));
-        });
+        self.dispatch(
+            self.my_pulls_progress.request.cancellation.clone(),
+            move || {
+                if review {
+                    client.review_pulls_page(&login, next.as_deref())
+                } else {
+                    client.my_pulls_page(&login, next.as_deref())
+                }
+            },
+            move |result| Message::MyPulls { request, result },
+        );
     }
 
     fn load_more(&mut self) {
@@ -1026,11 +1104,11 @@ impl App {
         let Some(request) = self.preview_request.start() else {
             return;
         };
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let result = client.item_detail(&owner, &name, number);
-            let _ = sender.send(Event::Message(Message::Preview { request, result }));
-        });
+        self.dispatch(
+            self.preview_request.cancellation.clone(),
+            move || client.item_detail(&owner, &name, number),
+            move |result| Message::Preview { request, result },
+        );
     }
 
     fn selected_item(&self) -> Option<(String, u64, String)> {
@@ -1070,6 +1148,36 @@ impl App {
             }
         }
     }
+}
+
+fn selected_key<T, Key>(
+    load: &Load<Vec<T>>,
+    visible: &[usize],
+    state: &ListState,
+    key: impl Fn(&T) -> Key,
+) -> Option<Key> {
+    let Load::Loaded(items) = load else {
+        return None;
+    };
+    items.get(*visible.get(state.selected()?)?).map(key)
+}
+
+fn restore_selection<T, Key: PartialEq>(
+    load: &Load<Vec<T>>,
+    visible: &[usize],
+    state: &mut ListState,
+    selected: Option<Key>,
+    key: impl Fn(&T) -> Key,
+) {
+    let position = selected.and_then(|selected| {
+        let Load::Loaded(items) = load else {
+            return None;
+        };
+        visible
+            .iter()
+            .position(|index| items.get(*index).is_some_and(|item| key(item) == selected))
+    });
+    state.select(position.or_else(|| (!visible.is_empty()).then_some(0)));
 }
 
 fn matches_item(query: &str, title: &str, author: &str, number: u64) -> bool {
@@ -1373,6 +1481,196 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_repositories_keep_the_selected_identity_after_reordering() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("me/alpha"), repo("me/beta")]);
+        app.refilter();
+        app.repos_state.select(Some(1));
+        let (request, _) = app.repos_progress.start(false).unwrap();
+
+        app.on_message(Message::Repos {
+            request,
+            result: Ok(page(vec![repo("me/beta"), repo("me/alpha")], None)),
+        });
+
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/beta");
+        assert_eq!(app.repos_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn refreshed_detail_tabs_preserve_their_own_selections() {
+        let mut app = test_app();
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(repo("owner/project"));
+        app.issues = Load::Loaded(
+            serde_json::from_str(
+                r#"[
+            {"number":1,"title":"first issue","state":"open"},
+            {"number":2,"title":"second issue","state":"open"}
+        ]"#,
+            )
+            .unwrap(),
+        );
+        app.pulls = Load::Loaded(
+            serde_json::from_str(
+                r#"[
+            {"number":3,"title":"first pull","state":"open"},
+            {"number":4,"title":"second pull","state":"open"}
+        ]"#,
+            )
+            .unwrap(),
+        );
+        app.refilter();
+        app.issues_state.select(Some(1));
+        app.pulls_state.select(Some(1));
+        let (issues_request, _) = app.issues_progress.start(false).unwrap();
+        let (pulls_request, _) = app.pulls_progress.start(false).unwrap();
+
+        app.on_message(Message::Issues {
+            request: issues_request,
+            repo: "owner/project".to_string(),
+            result: Ok(page(
+                serde_json::from_str(
+                    r#"[
+                {"number":2,"title":"second issue","state":"closed"},
+                {"number":1,"title":"first issue","state":"open"}
+            ]"#,
+                )
+                .unwrap(),
+                None,
+            )),
+        });
+        app.on_message(Message::Pulls {
+            request: pulls_request,
+            repo: "owner/project".to_string(),
+            result: Ok(page(
+                serde_json::from_str(
+                    r#"[
+                {"number":4,"title":"second pull","state":"open"},
+                {"number":3,"title":"first pull","state":"open"}
+            ]"#,
+                )
+                .unwrap(),
+                None,
+            )),
+        });
+
+        assert_eq!(
+            app.selected_url().as_deref(),
+            Some("https://github.com/owner/project/issues/2")
+        );
+        assert_eq!(app.issues_state.selected(), Some(0));
+        app.toggle_tab();
+        assert_eq!(
+            app.selected_url().as_deref(),
+            Some("https://github.com/owner/project/pull/4")
+        );
+        assert_eq!(app.pulls_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn refreshed_personal_queues_identify_pulls_by_repository_and_number() {
+        for review in [false, true] {
+            let mut app = test_app();
+            app.screen = Screen::MyPulls;
+            app.review_mode = review;
+            app.my_pulls = Load::Loaded(serde_json::from_str(r#"[
+                {"number":42,"title":"first","state":"open","repository_url":"https://api.github.com/repos/me/alpha"},
+                {"number":42,"title":"second","state":"open","repository_url":"https://api.github.com/repos/me/beta"}
+            ]"#).unwrap());
+            app.refilter();
+            app.my_pulls_state.select(Some(1));
+            let (request, _) = app.my_pulls_progress.start(false).unwrap();
+
+            app.on_message(Message::MyPulls {
+                request,
+                result: Ok(page(serde_json::from_str(r#"[
+                    {"number":42,"title":"second","state":"open","repository_url":"https://api.github.com/repos/me/beta"},
+                    {"number":42,"title":"first","state":"open","repository_url":"https://api.github.com/repos/me/alpha"}
+                ]"#).unwrap(), None)),
+            });
+
+            assert_eq!(
+                app.selected_url().as_deref(),
+                Some("https://github.com/me/beta/pull/42")
+            );
+            assert_eq!(app.my_pulls_state.selected(), Some(0));
+        }
+    }
+
+    #[test]
+    fn narrowing_and_clearing_search_keeps_the_highlighted_repository() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("me/alpha"), repo("me/beta"), repo("me/gamma")]);
+        app.refilter();
+        app.repos_state.select(Some(1));
+        app.enter_search();
+        app.search_query = "beta".to_string();
+        app.refilter();
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/beta");
+        assert_eq!(app.repos_state.selected(), Some(0));
+
+        app.exit_search();
+
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/beta");
+        assert_eq!(app.repos_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn repository_search_does_not_reset_a_hidden_personal_queue_selection() {
+        let mut app = test_app();
+        app.screen = Screen::MyPulls;
+        app.my_pulls = Load::Loaded(serde_json::from_str(r#"[
+            {"number":1,"title":"first","state":"open","repository_url":"https://api.github.com/repos/me/alpha"},
+            {"number":2,"title":"second","state":"open","repository_url":"https://api.github.com/repos/me/beta"}
+        ]"#).unwrap());
+        app.repos = Load::Loaded(vec![repo("me/alpha")]);
+        app.refilter();
+        app.my_pulls_state.select(Some(1));
+        app.go_back();
+        app.enter_search();
+        app.search_query = "missing".to_string();
+        app.refilter();
+        let (request, _) = app.my_pulls_progress.start(false).unwrap();
+        app.on_message(Message::MyPulls {
+            request,
+            result: Ok(page(serde_json::from_str(r#"[
+                {"number":2,"title":"second","state":"open","repository_url":"https://api.github.com/repos/me/beta"},
+                {"number":1,"title":"first","state":"open","repository_url":"https://api.github.com/repos/me/alpha"}
+            ]"#).unwrap(), None)),
+        });
+        app.exit_search();
+        app.open_my_pulls();
+
+        assert_eq!(
+            app.selected_url().as_deref(),
+            Some("https://github.com/me/beta/pull/2")
+        );
+    }
+
+    #[test]
+    fn disappearing_selections_fall_back_to_the_first_visible_row_or_none() {
+        let mut app = test_app();
+        app.repos = Load::Loaded(vec![repo("me/alpha"), repo("me/beta")]);
+        app.refilter();
+        app.repos_state.select(Some(1));
+        let (request, _) = app.repos_progress.start(false).unwrap();
+        app.on_message(Message::Repos {
+            request,
+            result: Ok(page(vec![repo("me/alpha"), repo("me/gamma")], None)),
+        });
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/alpha");
+
+        let (request, _) = app.repos_progress.start(false).unwrap();
+        app.on_message(Message::Repos {
+            request,
+            result: Ok(page(vec![], None)),
+        });
+        assert!(app.repos_state.selected().is_none());
+        assert!(app.selected_url().is_none());
+    }
+
+    #[test]
     fn search_enter_opens_the_filtered_repository() {
         let mut app = test_app();
         app.repos = Load::Loaded(vec![repo("user/alpha"), repo("user/beta")]);
@@ -1529,6 +1827,118 @@ mod tests {
         let second = request.start().unwrap();
         assert_ne!(first, second);
         assert!(request.finish(second));
+    }
+
+    #[test]
+    fn invalidation_cancels_queued_work_without_cancelling_the_next_generation() {
+        let mut app = test_app();
+        app.request_pool = RequestPool::with_limits(1, 1).unwrap();
+        let (started, occupied) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        app.request_pool
+            .execute(Cancellation::default(), move || {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+            })
+            .unwrap();
+        occupied
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let old = app.repos_progress.request.start().unwrap();
+        app.dispatch(
+            app.repos_progress.request.cancellation.clone(),
+            || panic!("abandoned repository fetch ran"),
+            move |result| Message::Repos {
+                request: old,
+                result,
+            },
+        );
+
+        app.repos_progress.reset();
+        let current = app.repos_progress.request.start().unwrap();
+        let (completed, result) = mpsc::channel();
+        app.request_pool
+            .execute(app.repos_progress.request.cancellation.clone(), move || {
+                completed.send(()).unwrap();
+            })
+            .unwrap();
+        release.send(()).unwrap();
+
+        result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(old, current);
+        assert!(app.repos_progress.request.in_flight);
+    }
+
+    #[test]
+    fn saturated_dispatch_finishes_every_resource_with_a_retryable_error() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut app = App::new(Some(Github::new("test-token".to_string())), sender);
+        app.request_pool = RequestPool::with_limits(1, 1).unwrap();
+        let (started, occupied) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        app.request_pool
+            .execute(Cancellation::default(), move || {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+            })
+            .unwrap();
+        occupied
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        app.request_pool
+            .execute(Cancellation::default(), || {})
+            .unwrap();
+
+        app.bootstrap();
+        assert!(matches!(&app.user, Load::Failed(error) if error.contains("retry")));
+        assert!(matches!(&app.repos, Load::Failed(error) if error.contains("retry")));
+        assert!(!app.user_request.in_flight);
+        assert!(!app.repos_progress.loading());
+
+        let repository = repo("owner/project");
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(repository.clone());
+        app.fetch_issues(&repository, false);
+        app.fetch_pulls(&repository, false);
+        assert!(matches!(&app.issues, Load::Failed(error) if error.contains("retry")));
+        assert!(matches!(&app.pulls, Load::Failed(error) if error.contains("retry")));
+        assert!(!app.issues_progress.loading());
+        assert!(!app.pulls_progress.loading());
+
+        app.user = Load::Loaded(User {
+            login: "octocat".to_string(),
+        });
+        app.open_my_pulls();
+        assert!(matches!(&app.my_pulls, Load::Failed(error) if error.contains("retry")));
+        assert!(!app.my_pulls_progress.loading());
+
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(repository);
+        app.issues = Load::Loaded(
+            serde_json::from_str(r#"[{"number":42,"title":"work","state":"open"}]"#).unwrap(),
+        );
+        app.refilter();
+        app.open_preview();
+        assert!(app.preview_open);
+        assert!(matches!(&app.preview, Load::Failed(error) if error.contains("retry")));
+        assert!(!app.preview_request.in_flight);
+
+        app.repos = Load::Loaded(vec![repo("me/retained")]);
+        app.screen = Screen::Repos;
+        app.refilter();
+        app.refresh();
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/retained");
+        assert!(
+            app.repos_progress
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("retry")
+        );
+        assert!(!app.repos_progress.loading());
+        release.send(()).unwrap();
     }
 
     #[test]
@@ -2005,15 +2415,21 @@ mod tests {
 
     #[test]
     fn closing_preview_rejects_its_pending_response() {
-        let (mut app, rx, server) =
-            issue_preview_app(vec![r#"{"number":42,"title":"work","state":"open"}"#]);
-        app.open_preview();
+        let mut app = test_app();
+        app.screen = Screen::RepoDetail;
+        app.preview_open = true;
+        app.preview = Load::Loading;
+        let request = app.preview_request.start().unwrap();
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        receive_message(&mut app, &rx);
+        app.on_message(Message::Preview {
+            request,
+            result: Ok(
+                serde_json::from_str(r#"{"number":42,"title":"work","state":"open"}"#).unwrap(),
+            ),
+        });
         assert!(!app.preview_open);
         assert!(!app.preview_request.in_flight);
         assert!(matches!(app.preview, Load::Loading));
-        server.join().unwrap();
     }
 
     #[test]

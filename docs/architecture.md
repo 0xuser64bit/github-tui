@@ -4,7 +4,7 @@
   <img src="../assets/architecture.png" alt="Architecture diagram: terminal, app and event channel, worker threads, and the GitHub REST API" width="1100">
 </p>
 
-`github-tui` is a single-process Rust application. One thread owns the screen and all application state. Each network fetch runs on its own short-lived worker thread. A single `mpsc` channel carries terminal input, animation ticks, and fetch results back to the UI thread.
+`github-tui` is a single-process Rust application. One thread owns the screen and all application state. A lazy, session-owned pool runs at most four network fetches concurrently and queues at most sixteen more. A single `mpsc` channel carries terminal input, animation ticks, and fetch results back to the UI thread.
 
 That design keeps the code small enough to read in an afternoon and keeps slow network calls off the render path. There is no async runtime, background daemon, disk cache, or shared application state between threads.
 
@@ -37,6 +37,7 @@ Token resolution happens **before** terminal setup so that `gh` can print normal
 | `auth.rs` | Environment and GitHub CLI token resolution |
 | `app.rs` | Screens, key handling, search/filter state, request dispatch, background fetch coordination |
 | `event.rs` | `Event`/`Message` types, the input thread, the tick thread, and the shared channel |
+| `requests.rs` | Bounded fetch workers, nonblocking queue admission, cancellation, and shutdown |
 | `github.rs` | Blocking REST client, pagination, response bounds, URL validation, HTTP error translation |
 | `models.rs` | Serde models for only the GitHub fields the UI renders |
 | `ui.rs` | Pure Ratatui rendering, layout, help/auth/preview overlays |
@@ -50,7 +51,7 @@ The crate is split into a library (`github_tui`) and a thin binary. This keeps a
 key press
    │
    ▼
-App::on_key ──► state transition ──► spawn worker thread
+App::on_key ──► state transition ──► bounded fetch queue
    │                                      │
    │                                      ▼
    │                              Github::* page call
@@ -66,7 +67,7 @@ A concrete fetch looks like this:
 
 1. The input thread forwards a crossterm key event to the channel.
 2. `App::on_key` mutates UI state and, when required, starts a fetch.
-3. `ListProgress::start` records a generation and an in-flight flag. The app coalesces repeated requests for the same loading resource.
+3. `ListProgress::start` records a generation, a cancellation handle, and an in-flight flag. The app coalesces repeated requests for the same loading resource. Queue admission does not wait for an available worker; a full queue or worker-start failure follows the ordinary error-result path instead of leaving a spinner running.
 4. The worker calls the typed `Github` method and sends a `Message` with the generation and, for repository-scoped requests, the repository name.
 5. `App::on_message` rejects results from an older generation or a repository the user has already left. A late response cannot overwrite a newer view.
 6. A successful page updates `Load`, replaces or appends items, records the next cursor, and clears errors. A failed refresh leaves the loaded list intact and stores an error notice.
@@ -110,7 +111,9 @@ The app stores an error on a **loaded** list in `ListProgress.error` instead of 
 
 ### Selection and filtering
 
-Lists use Ratatui's `ListState` over *filtered index vectors* (`filtered_repos`, `filtered_issues`, and so on). The indices point back into the loaded data, so filtering never copies or reorders the source list. `refilter` rebuilds those vectors from the current query and state filter, then clamps the cursor to the visible length.
+Lists use Ratatui's `ListState` over *filtered index vectors* (`filtered_repos`, `filtered_issues`, and so on). The indices point back into the loaded data, so filtering never copies or reorders the source list. Before applying a result or rebuilding filters, the app records every selected resource's identity: repository full name, issue/PR number, or `(repository, number)` for personal queues. After rebuilding, it restores that identity's visible position. A missing selection falls back to the first visible row, or no selection when the list is empty.
+
+Only the active list receives the current query and state filter. Hidden tabs and queues retain unfiltered membership and identity-based selections, including when their results arrive while another screen has a search active. Clearing search does not first discard the old index vectors: they are needed to identify the highlighted resource before rebuilding.
 
 Search is a case-insensitive substring match over loaded data only. Issues and PRs match title, author, and number (the app strips an optional leading `#` from the number query). Repositories match name, full name, and description. Personal PR queues also match repository names.
 
@@ -129,12 +132,14 @@ This ordering is why `n` types a character during search but pages a list otherw
 - **UI thread:** owns `App`, all state, all rendering, and all terminal writes. It never performs HTTP, file I/O, or browser process waits.
 - **Input thread:** blocks on `crossterm::event::read` and forwards terminal events. An input failure is sent to the UI as an error so the terminal can be restored.
 - **Tick thread:** emits an `Event::Tick` every 200 ms. Spinner frames advance only while a fetch is active.
-- **Worker threads:** one per fetch. They own their request and use a clone of the `Github` client. The underlying `ureq::Agent` is reference-counted, so clones are cheap.
+- **Worker threads:** four per application, started lazily on the first fetch. They take work from a bounded FIFO queue, release its lock before running HTTP, and use cheap clones of the reference-counted `ureq::Agent`.
 - **Browser reaper:** the app spawns browser launchers with null stdio and waits on them in a worker thread, so a slow launcher cannot stall the UI.
 
-The only mutable cross-thread state is the event channel and the client's shared rate-limit cooldown (`Arc<Mutex<Option<(Instant, Duration)>>>`). There are no locks around app data because app data never leaves the UI thread.
+The mutable cross-thread state is the event channel, the worker queue, cancellation flags, and the client's shared rate-limit cooldown (`Arc<Mutex<Option<(Instant, Duration)>>>`). There are no locks around app data because app data never leaves the UI thread.
 
-The app uses blocking `ureq` on dedicated threads instead of an async runtime because the workload is a handful of independent page requests, not high concurrency. This removes a large dependency surface and makes cancellation and generation logic explicit in application code.
+Invalidating a request cancels its queued work. Workers skip cancelled jobs, and each submission removes cancelled jobs before checking queue capacity, so abandoned views cannot fill the pending queue. A request that has already started may finish within the HTTP timeout; its generation still prevents stale results from changing the app. Dropping the application discards queued jobs and wakes idle workers without joining active HTTP requests. Keeping a personal queue in the background intentionally does not invalidate its request.
+
+The app uses blocking `ureq` on bounded workers instead of an async runtime because the workload is a handful of independent page requests, not high concurrency. This removes a large dependency surface and makes cancellation and generation logic explicit in application code. The UI can briefly take the queue lock, but never holds it during HTTP and never waits for queue capacity.
 
 ## Network layer
 
@@ -220,7 +225,7 @@ The security model and reporting process are in [SECURITY.md](../SECURITY.md).
 The application chooses a small, legible design over a feature-complete GitHub client:
 
 - **REST over GraphQL.** Simpler typed models and pagination, at the cost of more requests for some views.
-- **Blocking workers over async.** Predictable lifecycle and no runtime, at the cost of a thread per in-flight fetch.
+- **Bounded blocking workers over async.** Four active fetches and sixteen pending jobs bound resource use without a runtime. Already-running requests cannot be cancelled; timeout and generation checks contain their lifetime and effects.
 - **Loaded-row search over remote search.** Instant, free, and honest about what is loaded; it cannot find unseen history.
 - **Search API for personal queues.** Necessary to answer “my PRs across all repos,” with GitHub's 1,000-result cap and tighter rate limit as the trade-off.
 - **Plain-text previews over Markdown rendering.** Small dependency surface and no HTML sanitizer; complex descriptions are less pretty.
