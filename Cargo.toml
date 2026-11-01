@@ -2,8 +2,10 @@
 name = "github-tui"
 version = "0.1.0"
 description = "A read-only terminal UI for browsing GitHub repositories, issues, and pull requests"
-authors = ["user-64bit <arth.prajapati@outlook.com>"]
+authors = ["0xuser64bit"]
 license = "MIT"
+repository = "https://github.com/0xuser64bit/github-tui"
+readme = "README.md"
 edition = "2024"
 rust-version = "1.88"
 

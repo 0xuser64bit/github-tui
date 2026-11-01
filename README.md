@@ -1,163 +1,156 @@
-# github-tui
+<p align="center">
+  <img src="assets/brand/logo.svg" alt="github-tui: GitHub, without leaving the terminal" width="560">
+</p>
 
-A fast, read-only terminal UI for browsing your GitHub **repositories**,
-**issues**, and **pull requests** — without leaving the keyboard. Built with
-[Ratatui].
+<p align="center">
+  <a href="https://github.com/0xuser64bit/github-tui/actions/workflows/ci.yml"><img src="https://github.com/0xuser64bit/github-tui/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3fb950" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/rust-1.88%2B-e3b341" alt="Rust 1.88+">
+  <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-8b98a9" alt="Linux, macOS, and Windows">
+</p>
 
-> Status: early MVP. Read-only by design (see [Scope](#scope)).
+<p align="center">
+  <b>Read-only. Keyboard-first. Out of your way.</b><br>
+  Browse repositories, issues, and pull requests without leaving the terminal.
+</p>
 
-## Features
+<p align="center">
+  <img src="assets/screenshots/repositories.png" alt="github-tui repository list showing names, languages, stars, and open item counts" width="1000">
+  <br>
+  <sub>Sample data. Rendered by the real Ratatui UI.</sub>
+</p>
 
-- Browse repositories you own, collaborate on, or share via an org
-- Drill into a repository's **Issues** and **Pull Requests** in tabs
-- View **your pull requests** across accessible repositories (`m`), or open PRs
-  requesting your review (`v`)
-- Load results one page at a time (`n`); keep loaded rows if a later request fails
-- Search loaded items by title, number, or author (`/`), and cycle state filters (`s`)
-- Preview issue and PR descriptions without leaving the terminal (`p`)
-- Open the current repo / issue / PR in your browser (`o` or `Enter`)
-- Non-blocking UI: network requests never freeze rendering or input
-- Loading spinners, empty states, and actionable error messages
-  (auth failures, rate limits, network errors)
-- Vim-style and arrow-key navigation, with an in-app help overlay (`?`)
+`github-tui` is a small Rust terminal client for the in-between moments: checking what broke, skimming a pull request, clearing your review queue, or finding an issue without opening a browser. It is **pre-1.0 and read-only by design**: every action that changes GitHub stays where it belongs, in GitHub.
 
-## Install
+## Why another GitHub client?
 
-Requires Rust 1.88+ (edition 2024).
+- **Keyboard first.** Vim motions, arrow keys, single-key actions, and an in-app help overlay. Your hands stay on the home row.
+- **Read-only by design.** No accidental comments, merges, or state changes. A read-only token is enough.
+- **Fast and local.** One Rust binary, no daemon, no database, no telemetry. Network work runs on worker threads, so the UI never waits.
+- **Honest about incomplete data.** Search filters loaded rows, pagination has an explicit next-page key, and warnings appear when GitHub caps results.
+- **Small surface area.** `github.com` only, `GET` requests only, no disk cache, and a token that is never persisted.
+
+## What it does
+
+- **Repository inbox**: every repository you own, collaborate on, or reach through an organization, sorted by recent activity.
+- **Issues and pull requests**: separate tabs with state, author, draft and merged markers, and comment counts on issues. State filters compose with text search.
+- **Your personal queues**: `m` shows pull requests you authored across all repositories; `v` shows open pull requests requesting your review.
+- **On-demand previews**: `p` fetches an issue or PR description without leaving the list. Scroll with `j`/`k`; open the item in your browser when you need more.
+- **Search that tells the truth**: `/` filters the rows already loaded by repository name or description, title, author, or number. It does not silently pretend to search GitHub's full history.
+- **A clean browser handoff**: `o` opens the selected repository, issue, or PR on github.com after validating the URL. `Enter` drills into repositories and opens issues or pull requests in the browser.
+
+<p align="center">
+  <img src="assets/screenshots/issues.png" alt="github-tui issues tab for ratatui/ratatui with open and closed issue rows" width="1100">
+  <br>
+  <sub>Issues and pull requests share one repository view. State and text filters compose.</sub>
+</p>
+
+## Keys you'll use
+
+| Key | Action |
+| --- | --- |
+| `↑` / `k`, `↓` / `j` | Move the selection |
+| `g` / `Home`, `G` / `End` | Jump to the first or last row |
+| `Enter` / `l` / `→` | Open a repository, or open the selected issue/PR in the browser |
+| `Esc` / `h` / `←` | Go back |
+| `Tab` | Switch Issues / Pull Requests |
+| `m` | Your pull requests |
+| `v` | Open pull requests requesting your review |
+| `p` | Preview the selected issue or PR |
+| `/` | Search the loaded rows |
+| `s` | Cycle state: all → open → closed → merged (issues skip merged) |
+| `n` | Load the next page, keeping existing rows |
+| `o` | Open the selection on github.com |
+| `r` | Refresh the current view |
+| `?` | Toggle help |
+| `q` / `Ctrl-C` | Quit |
+
+The [user guide](docs/usage.md) covers every mode, search semantics, pagination, and troubleshooting.
+
+## Quick start
+
+**Requirements:** Rust 1.88+ and a github.com account. The app runs on Linux, macOS, and Windows. There are no packaged releases yet, so build from source.
 
 ```sh
-git clone https://github.com/user-64bit/github-tui
+git clone https://github.com/0xuser64bit/github-tui.git
 cd github-tui
 cargo run --release
 ```
 
-## Authentication
+To install the binary on your `PATH` instead:
 
-github-tui never stores a token; it resolves one at startup, first match wins:
+```sh
+cargo install --locked --path .
+github-tui
+```
 
-1. `GITHUB_TOKEN` environment variable
-2. `GH_TOKEN` environment variable
-3. the [GitHub CLI] (`gh auth token --hostname github.com`), if you're logged in
+### Authenticate
 
-Only **github.com** is supported. Enterprise credentials are not selected by the
-CLI fallback, even when `GH_HOST` points at an Enterprise server.
-
-The simplest path is the GitHub CLI:
+If you already use the GitHub CLI, reuse its session:
 
 ```sh
 gh auth login --hostname github.com
 ```
 
-Or use a [personal access token] with read access to the repositories you care
-about. Prefer a fine-grained token limited to those repositories with read-only
-**Issues** and **Pull requests** permissions. A classic token's `repo` scope
-also works, but grants broad write permissions even though this app only reads:
+Or export a token for the current shell:
 
 ```sh
-export GITHUB_TOKEN=ghp_xxx
+export GITHUB_TOKEN=github_pat_...
 cargo run --release
 ```
 
-If no token is found, the app starts and explains how to provide one rather
-than failing.
+The app resolves a token once at startup; the first available source wins:
 
-## Keybindings
+1. `GITHUB_TOKEN`
+2. `GH_TOKEN`
+3. `gh auth token --hostname github.com`
 
-| Key | Action |
-| --- | --- |
-| `↑` / `k`, `↓` / `j` | Move selection |
-| `g` / `Home`, `G` / `End` | Jump to first / last |
-| `Enter` / `l` / `→` | Open repository (or issue/PR in browser) |
-| `Esc` / `h` / `←` | Back to repository list |
-| `Tab` | Switch Issues / Pull Requests |
-| `m` | View your pull requests |
-| `v` | View open pull requests requesting your review |
-| `/` | Search loaded rows; `Esc` clears, `Enter` opens the highlighted match |
-| `s` | Cycle all / open / closed / merged (issues omit merged) |
-| `n` | Load the next page of the current list |
-| `p` | Preview the selected issue or PR; `Esc` closes |
-| `o` | Open current selection in browser |
-| `r` | Refresh the current view |
-| `?` | Toggle help |
-| `q` / `Ctrl-C` | Quit |
+For a fine-grained token, grant **Metadata: read**, **Issues: read**, and **Pull requests: read**, and select only the repositories you need. A classic token with the `repo` scope also works, but grants broad write access even though `github-tui` only sends `GET` requests. The app never logs the token or writes it to disk.
 
-Previews show plain-text descriptions. Use `j`/`k` or arrows to scroll, `g` to
-return to the top, `r` to retry loading, and `o` to open the previewed item in
-your browser. Browser shortcuts and `Enter` still work directly from lists.
+Only **github.com** is supported. The app does not select GitHub Enterprise credentials, even when `GH_HOST` points elsewhere.
 
-Search and state filters apply to **loaded rows**, not unseen pages. Load more
-pages with `n` after leaving search. State filters reset when switching screens
-or repository tabs. Closed and merged PRs are separate filters. My PRs and the
-review queue retain loaded results while you visit repositories; switching
-between those two queues starts a new query. Refresh replaces the current
-list only after a successful response and retains useful rows on failure.
+## Under the hood
 
-## Scope
+<p align="center">
+  <img src="assets/architecture.png" alt="github-tui architecture: terminal, app and events, worker threads, and the GitHub REST API" width="1100">
+</p>
 
-This is intentionally **read-only**. There is no creating, editing, commenting,
-or merging — those add token-scope, validation, and confirmation-flow surface
-that the first version deliberately avoids. The browser integration (`o`) is the
-escape hatch for actions that need the full GitHub UI.
+One UI thread owns state and draws. Every fetch runs on its own worker thread, and a single `mpsc` channel carries input, ticks, and results. Request generations discard responses for views you have already left. There is no async runtime, background daemon, or disk cache.
 
-The personal PR queues use GitHub's Search API, normally limited to 30
-authenticated requests per minute. Opening a queue costs one request for its
-first page, and each `n` costs another request. Results are ordered by recent
-updates. Repeated refreshes are coalesced while loading, and API rate-limit
-cooldowns are shared across the app's requests.
+Read [the architecture guide](docs/architecture.md) for the state machine, concurrency model, API surface, and failure behavior.
 
-GitHub Search exposes at most 1,000 results per query and searches at most
-4,000 matching repositories. The app shows warnings for reported timeouts or
-result caps; it does not promise exhaustive history. Pages reflect live data,
-so changes while paging can move results. Repository issue/PR lists can be
-continued through their available history. See [GitHub Search limits].
+## Scope, deliberately
 
-## Architecture
-
-```
-main → auth (resolve token) → App.run(terminal, events)
-                                     │
-        ┌────────────────────────────┴───────────────────────────┐
-        │                 mpsc::channel<Event>                     │
-   input thread        tick thread          worker threads (per fetch)
- (terminal events)   (spinner ticks)     (github::Github → REST → JSON)
-```
-
-- `models` — typed GitHub resources (`serde`); only rendered fields are modeled
-- `github` — a cloneable, blocking REST client (`ureq` + rustls; no OpenSSL)
-- `auth` — token resolution
-- `event` — the single channel multiplexing input, ticks, and fetch results
-- `app` — state machine, key handling, and fetch dispatch
-- `ui` — pure rendering of `App` state
-
-Network requests run off the UI thread. Request generations reject responses
-from superseded views; repeated requests for a loading resource are coalesced.
-Browser launchers are reaped by worker threads. Idle animation ticks do not
-redraw loaded lists, and input failures return through normal terminal cleanup.
+- **Read-only.** No creating, editing, commenting, reviewing, or merging. Open the browser for that.
+- **`github.com` only.** GitHub Enterprise is not supported.
+- **Search is local to loaded rows.** Use `n` to load more pages; Search API queues expose at most 1,000 results and have tighter rate limits.
+- **No cache, notifications, or rich Markdown.** Previews show plain text exactly as stored in the issue or PR body.
+- **Live data is not a snapshot.** Pages can shift while you browse, and GitHub's API rate limits still apply.
+- **Unofficial.** `github-tui` is not affiliated with or endorsed by GitHub.
 
 ## Development
 
 ```sh
-cargo fmt --all
+cargo fmt --all -- --check
 cargo clippy --locked --all-features --all-targets -- -D warnings
-cargo test --locked --all-features --all-targets  # unit tests + local HTTP fixtures; no GitHub requests
-cargo +1.88.0 test --locked --all-features --all-targets  # minimum compiler
-cargo test --test live -- --ignored --nocapture   # live API smoke test
+cargo test --locked --all-features --all-targets
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+cargo test --test live -- --ignored --nocapture   # credentialed live smoke test
 ```
 
-The library/binary split means logic lives in a testable library crate
-(`github_tui`) with a thin binary on top.
+Default tests use local HTTP fixtures; they never call GitHub. CI runs formatting, Clippy, documentation, the test suite on Linux/macOS/Windows, and the minimum compiler (Rust 1.88). See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
-The ignored live smoke test requires credentials and fails clearly when they
-are absent. It checks the account, repositories, issue/PR lists, and authored
-PR search; capped or incomplete Search results fail its completeness check.
-Regular tests use synthetic credentials and local fixtures. CI checks Rust
-1.88, current stable on Linux/macOS/Windows, formatting, Clippy, and documentation.
+## Documentation
+
+| Read this | If you want to… |
+| --- | --- |
+| [User guide](docs/usage.md) | Install, authenticate, learn every key, understand limits, and troubleshoot |
+| [Architecture](docs/architecture.md) | Follow a request through the app and understand its design trade-offs |
+| [Contributing](CONTRIBUTING.md) | Build, test, and submit a change |
+| [Security](SECURITY.md) | Report a vulnerability or understand the token and network model |
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+Licensed under the MIT license. See [LICENSE](LICENSE).
 
-[Ratatui]: https://ratatui.rs
-[GitHub CLI]: https://cli.github.com
-[personal access token]: https://github.com/settings/tokens
-[GitHub Search limits]: https://docs.github.com/en/rest/search/search#about-search
+`github-tui` is an independent project. GitHub is a trademark of GitHub, Inc.

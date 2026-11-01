@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">github-tui mark</title>
+  <desc id="desc">A terminal window containing a git branch.</desc>
+  <defs>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#56D4DD" stop-opacity=".18"/>
+      <stop offset=".6" stop-color="#56D4DD" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x=".5" y=".5" width="255" height="255" rx="54" fill="#0B0F14" stroke="#26303D"/>
+  <rect x="1" y="1" width="254" height="254" rx="53" fill="url(#glow)"/>
+  <g transform="translate(38 38) scale(1.42)">
+    <rect x=".5" y=".5" width="123" height="123" rx="26" fill="#10161F" stroke="#2A3441"/>
+    <rect x="18" y="25" width="88" height="73" rx="10" fill="#0B0F14" stroke="#56D4DD" stroke-width="2"/>
+    <path d="M18 41h88" stroke="#2A3441" stroke-width="1.5"/>
+    <circle cx="28" cy="33.5" r="2.7" fill="#FF5F57"/>
+    <circle cx="38" cy="33.5" r="2.7" fill="#FEBC2E"/>
+    <circle cx="48" cy="33.5" r="2.7" fill="#28C840"/>
+    <path d="M44 55v30" stroke="#C9D1D9" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M44 69c11 0 11-11 25-11" stroke="#C9D1D9" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+    <circle cx="44" cy="53" r="4.2" fill="#56D4DD"/>
+    <circle cx="44" cy="88" r="4.2" fill="#3FB950"/>
+    <circle cx="72" cy="58" r="4.2" fill="#3FB950"/>
+    <rect x="75" y="81" width="15" height="4" rx="2" fill="#56D4DD"/>
+  </g>
+</svg>
