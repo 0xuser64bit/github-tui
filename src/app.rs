@@ -19,6 +19,7 @@ use ratatui::widgets::ListState;
 use crate::event::{Event, Events, Message};
 use crate::github::{Github, Page};
 use crate::models::{Issue, ItemDetail, PullRequest, Repo, SearchedPullRequest, User};
+use crate::requests::{Cancellation, RequestPool};
 use crate::ui;
 
 /// The async loading state of a piece of remote data.
@@ -61,6 +62,7 @@ impl<U> Load<Vec<U>> {
 struct Request {
     generation: u64,
     in_flight: bool,
+    cancellation: Cancellation,
 }
 
 impl Request {
@@ -70,6 +72,7 @@ impl Request {
         }
         self.generation = self.generation.wrapping_add(1);
         self.in_flight = true;
+        self.cancellation = Cancellation::default();
         Some(self.generation)
     }
 
@@ -82,6 +85,7 @@ impl Request {
     }
 
     fn invalidate(&mut self) {
+        self.cancellation.cancel();
         self.generation = self.generation.wrapping_add(1);
         self.in_flight = false;
     }
@@ -212,6 +216,7 @@ pub struct App {
     pub(crate) running: bool,
     client: Option<Github>,
     sender: Sender<Event>,
+    request_pool: RequestPool,
 
     pub(crate) user: Load<User>,
     pub(crate) repos: Load<Vec<Repo>>,
@@ -268,6 +273,7 @@ impl App {
             running: false,
             client,
             sender,
+            request_pool: RequestPool::default(),
             user: Load::Idle,
             repos: Load::Idle,
             repos_state: ListState::default(),
@@ -834,7 +840,22 @@ impl App {
         }
     }
 
-    // --- fetches (each spawns a worker thread) -----------------------------
+    // --- fetches (dispatched to bounded workers) ---------------------------
+
+    fn dispatch<T: Send + 'static>(
+        &mut self,
+        cancellation: Cancellation,
+        fetch: impl FnOnce() -> Result<T, String> + Send + 'static,
+        message: impl FnOnce(Result<T, String>) -> Message + Send + Clone + 'static,
+    ) {
+        let sender = self.sender.clone();
+        let rejected = message.clone();
+        if let Err(error) = self.request_pool.execute(cancellation, move || {
+            let _ = sender.send(Event::Message(message(fetch())));
+        }) {
+            self.on_message(rejected(Err(error)));
+        }
+    }
 
     fn fetch_user(&mut self) {
         let Some(client) = self.client.clone() else {
@@ -844,13 +865,11 @@ impl App {
             return;
         };
         self.user = Load::Loading;
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let _ = sender.send(Event::Message(Message::User {
-                request,
-                result: client.current_user(),
-            }));
-        });
+        self.dispatch(
+            self.user_request.cancellation.clone(),
+            move || client.current_user(),
+            move |result| Message::User { request, result },
+        );
     }
 
     fn fetch_repos(&mut self, more: bool) {
@@ -863,11 +882,11 @@ impl App {
         if !matches!(self.repos, Load::Loaded(_)) {
             self.repos = Load::Loading;
         }
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let result = client.repos_page(next.as_deref());
-            let _ = sender.send(Event::Message(Message::Repos { request, result }));
-        });
+        self.dispatch(
+            self.repos_progress.request.cancellation.clone(),
+            move || client.repos_page(next.as_deref()),
+            move |result| Message::Repos { request, result },
+        );
     }
 
     fn fetch_issues(&mut self, repo: &Repo, more: bool) {
@@ -882,15 +901,15 @@ impl App {
         if !matches!(self.issues, Load::Loaded(_)) {
             self.issues = Load::Loading;
         }
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let result = client.issues_page(&owner, &name, next.as_deref());
-            let _ = sender.send(Event::Message(Message::Issues {
+        self.dispatch(
+            self.issues_progress.request.cancellation.clone(),
+            move || client.issues_page(&owner, &name, next.as_deref()),
+            move |result| Message::Issues {
                 request,
                 repo: full,
                 result,
-            }));
-        });
+            },
+        );
     }
 
     fn fetch_pulls(&mut self, repo: &Repo, more: bool) {
@@ -905,15 +924,15 @@ impl App {
         if !matches!(self.pulls, Load::Loaded(_)) {
             self.pulls = Load::Loading;
         }
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let result = client.pulls_page(&owner, &name, next.as_deref());
-            let _ = sender.send(Event::Message(Message::Pulls {
+        self.dispatch(
+            self.pulls_progress.request.cancellation.clone(),
+            move || client.pulls_page(&owner, &name, next.as_deref()),
+            move |result| Message::Pulls {
                 request,
                 repo: full,
                 result,
-            }));
-        });
+            },
+        );
     }
 
     fn fetch_my_pulls(&mut self, more: bool) {
@@ -938,16 +957,18 @@ impl App {
         if !matches!(self.my_pulls, Load::Loaded(_)) {
             self.my_pulls = Load::Loading;
         }
-        let sender = self.sender.clone();
         let review = self.review_mode;
-        thread::spawn(move || {
-            let result = if review {
-                client.review_pulls_page(&login, next.as_deref())
-            } else {
-                client.my_pulls_page(&login, next.as_deref())
-            };
-            let _ = sender.send(Event::Message(Message::MyPulls { request, result }));
-        });
+        self.dispatch(
+            self.my_pulls_progress.request.cancellation.clone(),
+            move || {
+                if review {
+                    client.review_pulls_page(&login, next.as_deref())
+                } else {
+                    client.my_pulls_page(&login, next.as_deref())
+                }
+            },
+            move |result| Message::MyPulls { request, result },
+        );
     }
 
     fn load_more(&mut self) {
@@ -1026,11 +1047,11 @@ impl App {
         let Some(request) = self.preview_request.start() else {
             return;
         };
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let result = client.item_detail(&owner, &name, number);
-            let _ = sender.send(Event::Message(Message::Preview { request, result }));
-        });
+        self.dispatch(
+            self.preview_request.cancellation.clone(),
+            move || client.item_detail(&owner, &name, number),
+            move |result| Message::Preview { request, result },
+        );
     }
 
     fn selected_item(&self) -> Option<(String, u64, String)> {
@@ -1532,6 +1553,118 @@ mod tests {
     }
 
     #[test]
+    fn invalidation_cancels_queued_work_without_cancelling_the_next_generation() {
+        let mut app = test_app();
+        app.request_pool = RequestPool::with_limits(1, 1).unwrap();
+        let (started, occupied) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        app.request_pool
+            .execute(Cancellation::default(), move || {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+            })
+            .unwrap();
+        occupied
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let old = app.repos_progress.request.start().unwrap();
+        app.dispatch(
+            app.repos_progress.request.cancellation.clone(),
+            || panic!("abandoned repository fetch ran"),
+            move |result| Message::Repos {
+                request: old,
+                result,
+            },
+        );
+
+        app.repos_progress.reset();
+        let current = app.repos_progress.request.start().unwrap();
+        let (completed, result) = mpsc::channel();
+        app.request_pool
+            .execute(app.repos_progress.request.cancellation.clone(), move || {
+                completed.send(()).unwrap();
+            })
+            .unwrap();
+        release.send(()).unwrap();
+
+        result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(old, current);
+        assert!(app.repos_progress.request.in_flight);
+    }
+
+    #[test]
+    fn saturated_dispatch_finishes_every_resource_with_a_retryable_error() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut app = App::new(Some(Github::new("test-token".to_string())), sender);
+        app.request_pool = RequestPool::with_limits(1, 1).unwrap();
+        let (started, occupied) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        app.request_pool
+            .execute(Cancellation::default(), move || {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+            })
+            .unwrap();
+        occupied
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        app.request_pool
+            .execute(Cancellation::default(), || {})
+            .unwrap();
+
+        app.bootstrap();
+        assert!(matches!(&app.user, Load::Failed(error) if error.contains("retry")));
+        assert!(matches!(&app.repos, Load::Failed(error) if error.contains("retry")));
+        assert!(!app.user_request.in_flight);
+        assert!(!app.repos_progress.loading());
+
+        let repository = repo("owner/project");
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(repository.clone());
+        app.fetch_issues(&repository, false);
+        app.fetch_pulls(&repository, false);
+        assert!(matches!(&app.issues, Load::Failed(error) if error.contains("retry")));
+        assert!(matches!(&app.pulls, Load::Failed(error) if error.contains("retry")));
+        assert!(!app.issues_progress.loading());
+        assert!(!app.pulls_progress.loading());
+
+        app.user = Load::Loaded(User {
+            login: "octocat".to_string(),
+        });
+        app.open_my_pulls();
+        assert!(matches!(&app.my_pulls, Load::Failed(error) if error.contains("retry")));
+        assert!(!app.my_pulls_progress.loading());
+
+        app.screen = Screen::RepoDetail;
+        app.active_repo = Some(repository);
+        app.issues = Load::Loaded(
+            serde_json::from_str(r#"[{"number":42,"title":"work","state":"open"}]"#).unwrap(),
+        );
+        app.refilter();
+        app.open_preview();
+        assert!(app.preview_open);
+        assert!(matches!(&app.preview, Load::Failed(error) if error.contains("retry")));
+        assert!(!app.preview_request.in_flight);
+
+        app.repos = Load::Loaded(vec![repo("me/retained")]);
+        app.screen = Screen::Repos;
+        app.refilter();
+        app.refresh();
+        assert_eq!(app.selected_repo().unwrap().full_name, "me/retained");
+        assert!(
+            app.repos_progress
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("retry")
+        );
+        assert!(!app.repos_progress.loading());
+        release.send(()).unwrap();
+    }
+
+    #[test]
     fn repeated_refresh_keeps_one_request_and_the_loaded_selection() {
         let (mut app, rx, server, _) =
             fixture_app(vec![r#"[{"name":"new","full_name":"me/new"}]"#]);
@@ -2005,15 +2138,21 @@ mod tests {
 
     #[test]
     fn closing_preview_rejects_its_pending_response() {
-        let (mut app, rx, server) =
-            issue_preview_app(vec![r#"{"number":42,"title":"work","state":"open"}"#]);
-        app.open_preview();
+        let mut app = test_app();
+        app.screen = Screen::RepoDetail;
+        app.preview_open = true;
+        app.preview = Load::Loading;
+        let request = app.preview_request.start().unwrap();
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        receive_message(&mut app, &rx);
+        app.on_message(Message::Preview {
+            request,
+            result: Ok(
+                serde_json::from_str(r#"{"number":42,"title":"work","state":"open"}"#).unwrap(),
+            ),
+        });
         assert!(!app.preview_open);
         assert!(!app.preview_request.in_flight);
         assert!(matches!(app.preview, Load::Loading));
-        server.join().unwrap();
     }
 
     #[test]

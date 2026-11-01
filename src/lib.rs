@@ -6,4 +6,5 @@ pub mod auth;
 pub mod event;
 pub mod github;
 pub mod models;
+mod requests;
 pub mod ui;

@@ -115,7 +115,7 @@ Only **github.com** is supported. The app does not select GitHub Enterprise cred
   <img src="assets/architecture.png" alt="github-tui architecture: terminal, app and events, worker threads, and the GitHub REST API" width="1100">
 </p>
 
-One UI thread owns state and draws. Every fetch runs on its own worker thread, and a single `mpsc` channel carries input, ticks, and results. Request generations discard responses for views you have already left. There is no async runtime, background daemon, or disk cache.
+One UI thread owns state and draws. A bounded pool runs up to four fetches concurrently, and a single `mpsc` channel carries input, ticks, and results. Leaving a view cancels its queued fetches; request generations discard late responses. There is no async runtime, background daemon, or disk cache.
 
 Read [the architecture guide](docs/architecture.md) for the state machine, concurrency model, API surface, and failure behavior.
 
